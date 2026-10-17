@@ -1,184 +1,208 @@
-"""Rendered integration check. Run from the repo root; no OpenCV window is opened."""
+"""Hardware integration check for one NVIDIA Vulkan publisher and CUDA consumer."""
 
 from pathlib import Path
+import os
+import re
 import select
-import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
-from unittest.mock import patch
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from viewer import ADDRESS, FrameReceiver  # noqa: E402
+from gpu_receiver import address_for, GpuReceiver, RELEASE, verify_pattern  # noqa: E402
 
-ADDRESSES = (ADDRESS, (ADDRESS[0], 5002), (ADDRESS[0], 5003))
+BINARY = ROOT / "build/godot-src/bin/godot.linuxbsd.template_debug.x86_64"
 
 
-def connect(process, address=ADDRESS):
-    deadline = time.monotonic() + 15
+def connect(process):
+    deadline = time.monotonic() + 25
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise AssertionError(f"Godot exited early: {process.returncode}")
+            raise AssertionError(
+                f"Godot exited early: {process.returncode}, see build/gpu-integration-godot.log"
+            )
         try:
-            sock = socket.create_connection(address, timeout=0.2)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return FrameReceiver(sock)
-        except OSError:
+            return GpuReceiver.connect("camera1_a")
+        except (ConnectionRefusedError, FileNotFoundError):
             time.sleep(0.05)
-    raise AssertionError("Timed out connecting to Godot")
+    raise AssertionError("Timed out waiting for GPU publisher")
 
 
-def next_frame(receiver):
-    deadline = time.monotonic() + 5
+def next_frame(receiver, timeout=5):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        frame = receiver.poll()
+        frame = receiver.acquire()
         if frame is not None:
             return frame
-        select.select([receiver.sock], [receiver.sock] if receiver.outgoing else [], [], 0.005)
-    raise AssertionError("Timed out waiting for frame")
-
-
-def matching_frames(receivers):
-    frames = [None] * len(receivers)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        for index, receiver in enumerate(receivers):
-            frame = receiver.poll()
-            if frame is not None:
-                frames[index] = frame
-        if all(frame is not None for frame in frames) and len({reader.frame_id for reader in receivers}) == 1:
-            return frames
-        select.select([receiver.sock for receiver in receivers], [], [], 0.005)
-    raise AssertionError("Timed out matching the cameras' rendered frame IDs")
+        select.select([receiver.sock], [], [], 0.02)
+    raise AssertionError("Timed out waiting for GPU frame")
 
 
 def main():
-    # Refuse to consume an unrelated publisher or mistake it for our child process.
-    for address in ADDRESSES:
-        with socket.socket() as probe:
-            probe.bind(address)
-    receiver = receiver2 = receiver3 = None
-    with tempfile.TemporaryFile(mode="w+") as log:
+    # Do not connect to an unrelated publisher already using this user's address.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as probe:
+        probe.bind(address_for("camera1_a"))
+    env = dict(
+        os.environ, __NV_PRIME_RENDER_OFFLOAD="1", __VK_LAYER_NV_optimus="NVIDIA_only"
+    )
+    log_path = ROOT / "build/gpu-integration-godot.log"
+    receiver = None
+    with log_path.open("w") as log:
         process = subprocess.Popen(
-            ["godot", "--path", str(ROOT / "demo"), "--disable-vsync", "--quit-after", "330"],
-            stdout=log, stderr=subprocess.STDOUT,
+            [
+                str(BINARY),
+                "--path",
+                str(ROOT / "demo"),
+                "--disable-vsync",
+                "--print-fps",
+                "--",
+                "--gpu-frames=540",
+            ],
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
         )
         try:
             receiver = connect(process)
-            # Delay ACK to exercise a reader still copying the shared slot.
-            with patch.object(receiver, "_flush_ack"):
-                first = next_frame(receiver)
-                first_id = receiver.frame_id
-                assert first.shape == (480, 640, 3)
-                assert first.nbytes == 921600, "Expected tightly packed RGB8"
-                assert first.std() > 10, "Expected rendered scene, not a blank image"
-                snapshot = bytes(receiver.memory)
-                time.sleep(0.3)
-                assert bytes(receiver.memory) == snapshot, "Producer overwrote the slot before ACK"
-            second = next_frame(receiver)
-            assert receiver.frame_id > first_id + 1, "Slow consumer should skip rendered frames"
-            assert not np.array_equal(first, second), "Expected animated images"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as second:
+                second.settimeout(3)
+                second.connect(address_for("camera1_a"))
+                assert second.recv(100) == b"BUSY", "Second consumer must be rejected"
+            held = []
+            snapshots = []
+            for _ in range(3):
+                frame = next_frame(receiver)
+                assert frame.pattern, "First three frames must be GPU diagnostics"
+                pixels = receiver.download(frame)
+                verify_pattern(pixels)
+                held.append(frame)
+                snapshots.append(pixels)
+            assert len({f.slot for f in held}) == 3
+            time.sleep(0.25)
+            assert receiver.acquire() is None, "All held slots must stop publication"
+            for frame, snapshot in zip(held, snapshots):
+                assert np.array_equal(receiver.download(frame), snapshot), (
+                    "Publisher overwrote a held slot"
+                )
+            receiver.release(held[1])
+            recovered = next_frame(receiver)
+            assert recovered.slot == held[1].slot and not recovered.pattern
+            pixels = receiver.download(recovered)
+            assert pixels.shape == (480, 640, 4) and pixels[:, :, :3].std() > 10
+            assert np.all(pixels[:, :, 3] == 255)
+            receiver.release(recovered)
+            for frame in [held[0], held[2]]:
+                receiver.release(frame)
+            first_scene = pixels.copy()
+            for _ in range(12):
+                frame = next_frame(receiver)
+                pixels = receiver.download(frame)
+                receiver.release(frame)
+            assert not np.array_equal(first_scene, pixels), (
+                "Animated camera pixels must change"
+            )
+            import cv2
 
-            # SIGSTOP pauses rendering without running the application exit cleanup.
-            process.send_signal(signal.SIGSTOP)
-            time.sleep(0.05)
-            # Drain at most one already published frame, then the stopped producer must be idle.
-            receiver.poll()
-            assert receiver.poll() is None
-            process.send_signal(signal.SIGCONT)
-            next_frame(receiver)
-
+            cv2.imwrite(
+                str(ROOT / "build/gpu-camera.png"),
+                cv2.cvtColor(pixels, cv2.COLOR_RGBA2BGR),
+            )
             receiver.close()
-            receiver = connect(process)
-            next_frame(receiver)
-            receiver2 = connect(process, ADDRESSES[1])
-            receiver3 = connect(process, ADDRESSES[2])
-            frames = matching_frames([receiver, receiver2, receiver3])
-            for index, frame in enumerate(frames):
-                assert frame.shape == (480, 640, 3) and frame.nbytes == 921600
-                for other in frames[:index]:
-                    assert np.abs(frame.astype(np.int16) - other.astype(np.int16)).mean() > 1, \
-                        "Offset cameras must show different views of the same rendered frame"
-
-            with patch.object(receiver2, "_flush_ack"), patch.object(receiver3, "_flush_ack"):
-                next_frame(receiver2)
-                next_frame(receiver3)
-                snapshot2 = bytes(receiver2.memory)
-                snapshot3 = bytes(receiver3.memory)
-                first_id = receiver.frame_id
-                for _ in range(5):
-                    next_frame(receiver)
-                assert receiver.frame_id > first_id, "A stalled camera 2 viewer blocked camera 1"
-                assert bytes(receiver2.memory) == snapshot2, "Camera 2 buffer changed without its ACK"
-                assert bytes(receiver3.memory) == snapshot3, "Camera 3 buffer changed without its ACK"
-            next_frame(receiver2)
-            next_frame(receiver3)
-            receiver.close()
-            next_frame(receiver2)  # Closing camera 1 must not stop camera 2.
-            next_frame(receiver3)
-            receiver = connect(process)
-            next_frame(receiver)
-
-            counts = [0, 0, 0]
-            start = time.monotonic()
-            while time.monotonic() - start < 3:
-                for index, reader in enumerate([receiver, receiver2, receiver3]):
-                    if reader.poll() is not None:
-                        counts[index] += 1
-                select.select([receiver.sock, receiver2.sock, receiver3.sock], [], [], 0.005)
-            duration = time.monotonic() - start
-            for address, count in zip(ADDRESSES, counts):
-                fps = count / duration
-                print(f"Camera {address[1]} rendered delivery: {fps:.1f} FPS ({count} frames)")
-                assert 0 < fps <= 32, "Expected frames within the 30 FPS cap"
-            receiver.close()
-            receiver2.close()
-            receiver3.close()
             receiver = None
-            receiver2 = None
-            receiver3 = None
-            # --quit-after goes through SceneTree shutdown; SIGINT may bypass scene cleanup.
-            process.wait(timeout=20)
-            log.seek(0)
-            output = log.read()
-            print(output)
-            assert process.returncode == 0, f"Godot exited with {process.returncode}"
-            assert "SCRIPT ERROR" not in output and "ERROR:" not in output, "Godot reported errors"
-            paths = set()
-            for line in output.splitlines():
-                if "shared memory: " in line:
-                    paths.add(Path("/dev/shm") / line.split("shared memory: ", 1)[1].lstrip("/"))
-            assert len(paths) == 3, "Expected three distinct shared-memory segments"
-            assert all(not path.exists() for path in paths), f"Shared-memory segment leaked: {paths}"
-            print("PASS: offset views, independent readers, ownership, pause/resume, reconnect, and cleanup")
-        except BaseException:
-            log.seek(0)
-            print(log.read(), file=sys.stderr)
-            raise
+            time.sleep(0.1)
+            receiver = connect(process)
+            frame = next_frame(receiver)
+            assert receiver.download(frame)[:, :, :3].std() > 10
+            receiver.release(frame)
+            # Malformed frame release must close this connection without terminating Godot.
+            receiver.sock.send(RELEASE.pack(b"REL1", 99, frame.frame_id))
+            deadline = time.monotonic() + 2
+            disconnected = False
+            while time.monotonic() < deadline:
+                try:
+                    pending = receiver.acquire()
+                    if pending is not None:
+                        receiver.download(pending)
+                except (EOFError, ConnectionResetError):
+                    disconnected = True
+                    break
+                time.sleep(0.02)
+            assert disconnected, "Malformed release must disconnect the consumer"
+            receiver.close()
+            receiver = None
+            # A killed CUDA consumer must not pin the next connection's slots.
+            child_code = """
+import select, time
+from gpu_receiver import GpuReceiver
+r = GpuReceiver.connect("camera1_a")
+held = []
+while len(held) < 3:
+    f = r.acquire()
+    if f is not None:
+        r.download(f)
+        held.append(f)
+    select.select([r.sock], [], [], 0.01)
+print('HELD', flush=True)
+time.sleep(20)
+"""
+            with (ROOT / "build/gpu-killed-consumer.log").open("w+") as child_log:
+                child = subprocess.Popen(
+                    [sys.executable, "-u", "-c", child_code],
+                    cwd=ROOT,
+                    stdout=child_log,
+                    stderr=subprocess.STDOUT,
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if (
+                            "HELD"
+                            in (ROOT / "build/gpu-killed-consumer.log").read_text()
+                        ):
+                            break
+                        assert child.poll() is None, (
+                            "CUDA child exited before acquiring slots"
+                        )
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("CUDA child did not acquire three slots")
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=5)
+            time.sleep(0.1)
+            receiver = connect(process)
+            frame = next_frame(receiver)
+            receiver.download(frame)
+            receiver.release(frame)
+            receiver.close()
+            receiver = None
+            assert process.wait(timeout=30) == 0, "Godot must exit normally"
+            content = log_path.read_text()
+            assert "NVIDIA" in content and "Vulkan" in content
+            assert any(int(n) > 0 for n in re.findall(r"Dropped: (\d+)", content))
+            assert any(
+                int(n) >= 25 for n in re.findall(r"Project FPS: (\d+)", content)
+            ), content
+            assert content.count("Invalid GPU release packet") == 1, content
+            assert "ERROR:" not in content and "VUID-" not in content, content
+            print(
+                "PASS: NVIDIA GPU import, exact pattern, 3 held slots, recovery, camera animation, single consumer per channel, reconnect, malformed release, killed CUDA consumer and normal shutdown"
+            )
         finally:
-            for reader in [receiver, receiver2, receiver3]:
-                if reader is not None:
-                    reader.close()
+            if receiver is not None:
+                receiver.close()
             if process.poll() is None:
-                process.send_signal(signal.SIGCONT)
-                process.send_signal(signal.SIGINT)
+                process.terminate()
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    process.wait()
-            # Failed checks may terminate Godot before its scene cleanup can run.
-            log.seek(0)
-            for line in log.read().splitlines():
-                prefix = f"shared memory: /godot_camera_{process.pid}_"
-                if prefix in line:
-                    orphan = Path("/dev/shm") / line.split("shared memory: ", 1)[1].lstrip("/")
-                    orphan.unlink(missing_ok=True)
+                    process.wait(timeout=5)
 
 
 if __name__ == "__main__":

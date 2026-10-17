@@ -1,107 +1,209 @@
-import json
+import array
 import os
-from pathlib import Path
 import socket
-import struct
-import time
 import unittest
 
 import numpy as np
 
-from viewer import ACK, FRAME_BYTES, HEIGHT, READY, WIDTH, FrameReceiver, ReceivedFPS
+from gpu_receiver import (
+    FRAME_BYTES,
+    HEIGHT,
+    READY,
+    RELEASE,
+    SETUP,
+    WIDTH,
+    GpuReceiver,
+    address_for,
+    decode_setup,
+    receive_packet,
+    verify_pattern,
+)
+from viewer import ReceivedFPS
 
 
-class FPSTest(unittest.TestCase):
-    def test_counts_frames_over_actual_elapsed_time_and_resets_when_idle(self):
-        fps = ReceivedFPS(10.0)
-        for _ in range(60):
-            fps.record()
-        fps.update(10.5)
-        self.assertEqual(fps.value, 0.0)
-        fps.update(11.2)
-        self.assertAlmostEqual(fps.value, 50.0)
-        fps.update(12.3)
-        self.assertEqual(fps.value, 0.0)
+def setup_packet():
+    return SETUP.pack(
+        b"GPG1", 1, WIDTH, HEIGHT, 3, FRAME_BYTES, b"1" * 16, *([FRAME_BYTES] * 3)
+    )
+
+
+class FakeCuda:
+    def __init__(self, uuid, sizes, fds):
+        self.pointers = [100, 200, 300]
+        self.waits = []
+        self.synced = 0
+        self.closed = False
+
+    def wait(self, slot):
+        self.waits.append(slot)
+
+    def synchronize(self):
+        self.synced += 1
+
+    def close(self):
+        self.closed = True
 
 
 class ReceiverTest(unittest.TestCase):
     def setUp(self):
-        self.producer, consumer = socket.socketpair()
-        self.producer.settimeout(1)
-        self.receiver = FrameReceiver(consumer)
-        self.path = Path("/dev/shm") / f"godot_camera_{os.getpid()}_{time.monotonic_ns()}"
-        self.file = self.path.open("xb")
-        self.file.truncate(FRAME_BYTES)
-        self.file.close()
-        self.path.chmod(0o600)
-        self.metadata = {
-            "version": 1, "shm": "/" + self.path.name,
-            "width": WIDTH, "height": HEIGHT, "format": "RGB8", "bytes": FRAME_BYTES,
-        }
+        self.server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        fds = [os.open("/dev/null", os.O_RDONLY) for _ in range(6)]
+        try:
+            self.server.sendmsg(
+                [setup_packet()],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))],
+            )
+        finally:
+            for fd in fds:
+                os.close(fd)
+        self.receiver = GpuReceiver(client, FakeCuda)
+        self.receiver.sock.setblocking(False)
 
     def tearDown(self):
         self.receiver.close()
-        self.producer.close()
-        self.path.unlink()
+        self.server.close()
 
-    def handshake(self, metadata=None):
-        payload = json.dumps(self.metadata if metadata is None else metadata).encode()
-        return struct.pack("<I", len(payload)) + payload
+    def ready(self, slot=0, frame=1):
+        self.server.send(READY.pack(b"RDY1", slot, 0, frame, 123))
 
-    def test_fragmented_messages_copy_before_ack_and_single_count(self):
-        message = self.handshake() + READY.pack(7, 123456)
-        for byte in message[:-1]:
-            self.producer.sendall(bytes([byte]))
-            self.assertIsNone(self.receiver.poll())
-        pixel = np.array([23, 77, 149], dtype=np.uint8)
-        self.path.write_bytes(pixel.tobytes() * (WIDTH * HEIGHT))
-        self.producer.sendall(message[-1:])
-        frame = self.receiver.poll()
-        self.assertEqual(frame.shape, (HEIGHT, WIDTH, 3))
-        self.assertEqual(frame.nbytes, 921600)
-        self.assertTrue(np.all(frame == pixel))
-        self.assertEqual(self.producer.recv(8), ACK.pack(7))
-        self.path.write_bytes(bytes([99]) * FRAME_BYTES)
-        self.assertTrue(np.all(frame == pixel), "Returned frame must own its pixels")
-        self.assertIsNone(self.receiver.poll())
-        self.assertEqual(self.receiver.frame_id, 7)
+    def test_release_synchronizes_before_ack_and_prevents_duplicate_release(self):
+        self.assertIsNone(self.receiver.acquire())
+        self.ready()
+        frame = self.receiver.acquire()
+        self.assertEqual(frame.device_pointer, 100)
+        self.assertEqual(self.receiver.cuda.waits, [0])
+        self.receiver.release(frame)
+        self.assertEqual(self.receiver.cuda.synced, 1)
+        self.assertEqual(self.server.recv(100), RELEASE.pack(b"REL1", 0, 1))
+        with self.assertRaises(ValueError):
+            self.receiver.release(frame)
 
-    def test_invalid_metadata_and_path_are_rejected(self):
-        self.producer.sendall(self.handshake({**self.metadata, "shm": "/../../etc/passwd"}))
-        with self.assertRaisesRegex(ValueError, "name"):
-            self.receiver.poll()
+    def test_all_three_slots_can_be_held_independently(self):
+        frames = []
+        for slot in range(3):
+            self.ready(slot, slot + 1)
+            frames.append(self.receiver.acquire())
+        self.assertEqual(len(self.receiver.held), 3)
+        for frame in reversed(frames):
+            self.receiver.release(frame)
+        self.assertEqual(self.receiver.held, {})
 
-    def test_old_rgba_metadata_is_rejected(self):
-        self.producer.sendall(self.handshake({
-            **self.metadata, "format": "RGBA8", "bytes": WIDTH * HEIGHT * 4,
-        }))
-        with self.assertRaisesRegex(ValueError, "Unsupported camera metadata"):
-            self.receiver.poll()
+    def test_rejects_overwrite_of_held_slot(self):
+        self.ready()
+        self.receiver.acquire()
+        self.ready(frame=2)
+        with self.assertRaises(ValueError):
+            self.receiver.acquire()
 
-    def test_incorrect_buffer_size_is_rejected(self):
-        self.path.write_bytes(b"short")
-        self.producer.sendall(self.handshake())
-        with self.assertRaisesRegex(ValueError, "size"):
-            self.receiver.poll()
+    def test_rejects_stale_and_oversized_notifications(self):
+        self.ready()
+        self.receiver.release(self.receiver.acquire())
+        self.ready()
+        with self.assertRaises(ValueError):
+            self.receiver.acquire()
+        self.server.send(b"x" * 100)
+        with self.assertRaises(ValueError):
+            self.receiver.acquire()
 
-    def test_oversized_handshake_is_rejected(self):
-        self.producer.sendall(struct.pack("<I", 1025))
-        with self.assertRaisesRegex(ValueError, "length"):
-            self.receiver.poll()
+    def test_rejects_unexpected_descriptors_without_leaking(self):
+        before = len(os.listdir("/proc/self/fd"))
+        fd = os.open("/dev/null", os.O_RDONLY)
+        try:
+            self.server.sendmsg(
+                [READY.pack(b"RDY1", 0, 0, 1, 123)],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))],
+            )
+        finally:
+            os.close(fd)
+        with self.assertRaises(ValueError):
+            self.receiver.acquire()
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
-    def test_duplicate_frame_is_rejected(self):
-        self.producer.sendall(self.handshake() + READY.pack(1, 100))
-        self.assertIsNotNone(self.receiver.poll())
-        self.receiver.poll()
-        self.producer.recv(8)
-        self.producer.sendall(READY.pack(1, 101))
-        with self.assertRaisesRegex(ValueError, "increase"):
-            self.receiver.poll()
+    def test_disconnect_is_detected(self):
+        self.server.close()
+        with self.assertRaises(EOFError):
+            self.receiver.acquire()
 
-    def test_disconnect_is_reported(self):
-        self.producer.close()
-        with self.assertRaises(ConnectionError):
-            self.receiver.poll()
+
+class ProtocolTest(unittest.TestCase):
+    def test_channels_have_distinct_validated_addresses(self):
+        self.assertNotEqual(address_for("camera1_a"), address_for("camera1_b"))
+        with self.assertRaises(ValueError):
+            address_for("camera/1")
+
+    def test_setup_validates_layout_fd_count_uuid_and_allocation(self):
+        decode_setup(setup_packet(), list(range(6)))
+        for packet, fds in [
+            (setup_packet(), []),
+            (b"BUSY", []),
+            (
+                SETUP.pack(
+                    b"GPG1",
+                    1,
+                    WIDTH,
+                    HEIGHT,
+                    3,
+                    FRAME_BYTES,
+                    bytes(16),
+                    *([FRAME_BYTES] * 3),
+                ),
+                list(range(6)),
+            ),
+            (
+                SETUP.pack(
+                    b"GPG1",
+                    1,
+                    WIDTH,
+                    HEIGHT,
+                    3,
+                    FRAME_BYTES,
+                    b"1" * 16,
+                    1,
+                    FRAME_BYTES,
+                    FRAME_BYTES,
+                ),
+                list(range(6)),
+            ),
+        ]:
+            with self.assertRaises(ValueError):
+                decode_setup(packet, fds)
+
+    def test_oversized_setup_closes_received_fds(self):
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        fd = os.open("/dev/null", os.O_RDONLY)
+        try:
+            before = len(os.listdir("/proc/self/fd"))
+            a.sendmsg(
+                [b"x" * 100],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))],
+            )
+            with self.assertRaises(ValueError):
+                receive_packet(b, SETUP.size)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        finally:
+            a.close()
+            b.close()
+            os.close(fd)
+
+    def test_pattern_detects_channel_order_and_orientation(self):
+        image = np.zeros((HEIGHT, WIDTH, 4), dtype=np.uint8)
+        image[:, :, 0] = np.arange(WIDTH, dtype=np.uint16) % 256
+        image[:, :, 1] = (np.arange(HEIGHT, dtype=np.uint16) % 256)[:, None]
+        image[:, :, 2:] = [73, 255]
+        verify_pattern(image)
+        with self.assertRaises(ValueError):
+            verify_pattern(image[::-1])
+        with self.assertRaises(ValueError):
+            verify_pattern(image[:, :, [2, 1, 0, 3]])
+
+    def test_received_fps_uses_actual_interval(self):
+        fps = ReceivedFPS(10)
+        for _ in range(60):
+            fps.record()
+        fps.update(11.2)
+        self.assertAlmostEqual(fps.value, 50)
+        fps.update(12.3)
+        self.assertEqual(fps.value, 0)
 
 
 if __name__ == "__main__":

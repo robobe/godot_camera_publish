@@ -2,18 +2,26 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Godot camera demo",
+      "name": "Godot publisher (background only)",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${env:HOME}/.local/bin/godot",
-      "args": ["--path", "${workspaceFolder}/demo"],
+      "program": "${workspaceFolder}/build/godot-src/bin/godot.linuxbsd.template_debug.x86_64",
+      "args": [
+        "--path",
+        "${workspaceFolder}/demo"
+      ],
       "cwd": "${workspaceFolder}",
       "environment": [
-        {"name": "__NV_PRIME_RENDER_OFFLOAD", "value": "1"},
-        {"name": "__GLX_VENDOR_LIBRARY_NAME", "value": "nvidia"}
+        {
+          "name": "__NV_PRIME_RENDER_OFFLOAD",
+          "value": "1"
+        },
+        {
+          "name": "__VK_LAYER_NV_optimus",
+          "value": "NVIDIA_only"
+        }
       ],
-      "MIMode": "gdb",
-      "preLaunchTask": "Build debug"
+      "MIMode": "gdb"
     }
   ]
 }

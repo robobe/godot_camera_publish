@@ -1,50 +1,130 @@
 {
   "version": "2.0.0",
   "tasks": [
-    {"label": "Configure debug", "type": "process", "command": "cmake", "args": ["--preset", "debug"], "problemMatcher": []},
-    {"label": "Build debug", "type": "process", "command": "cmake", "args": ["--build", "--preset", "debug"], "dependsOn": "Configure debug", "group": {"kind": "build", "isDefault": true}, "problemMatcher": ["$gcc"]},
+    {
+      "label": "Build GPU Godot",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": [
+        "${workspaceFolder}/tools/build_gpu_engine.py"
+      ],
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "Build GPU demo",
+      "dependsOn": [
+        "Build debug",
+        "Build GPU Godot"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Configure debug",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "--preset",
+        "debug"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Build debug",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "--preset",
+        "debug"
+      ],
+      "dependsOn": "Configure debug",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
     {
       "label": "Run Godot publisher",
       "type": "process",
-      "command": "${env:HOME}/.local/bin/godot",
-      "args": ["--path", "${workspaceFolder}/demo"],
+      "command": "${workspaceFolder}/build/godot-src/bin/godot.linuxbsd.template_debug.x86_64",
+      "args": [
+        "--path",
+        "${workspaceFolder}/demo"
+      ],
       "options": {
         "cwd": "${workspaceFolder}",
-        "env": {"__NV_PRIME_RENDER_OFFLOAD": "1", "__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
+        "env": {
+          "__NV_PRIME_RENDER_OFFLOAD": "1",
+          "__VK_LAYER_NV_optimus": "NVIDIA_only"
+        }
       },
-      "presentation": {"panel": "dedicated", "reveal": "always"},
-      "problemMatcher": []
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always"
+      },
+      "problemMatcher": [],
+      "detail": "Runs the already-built publisher. Run Build GPU demo explicitly after changing code or switching branches."
     },
     {
       "label": "Run Python viewer",
       "type": "process",
-      "command": "python3",
-      "args": ["-u", "${workspaceFolder}/viewer.py"],
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": [
+        "-u",
+        "${workspaceFolder}/viewer.py",
+        "--channel",
+        "camera1_a"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Python viewer (camera1 duplicate)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--channel", "camera1_b"],
       "options": {"cwd": "${workspaceFolder}"},
       "presentation": {"panel": "dedicated", "reveal": "always"},
       "problemMatcher": []
     },
     {
-      "label": "Run Python viewer 2",
+      "label": "Run Python viewer (camera2)",
       "type": "process",
-      "command": "python3",
-      "args": ["-u", "${workspaceFolder}/viewer.py", "--port", "5002"],
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--channel", "camera2"],
       "options": {"cwd": "${workspaceFolder}"},
       "presentation": {"panel": "dedicated", "reveal": "always"},
       "problemMatcher": []
     },
     {
-      "label": "Run Python viewer 3",
+      "label": "Run Python viewer (camera3)",
       "type": "process",
-      "command": "python3",
-      "args": ["-u", "${workspaceFolder}/viewer.py", "--port", "5003"],
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--channel", "camera3"],
       "options": {"cwd": "${workspaceFolder}"},
       "presentation": {"panel": "dedicated", "reveal": "always"},
       "problemMatcher": []
     },
     {
       "label": "Run camera demo (Godot + Python)",
-      "dependsOn": ["Run Godot publisher", "Run Python viewer", "Run Python viewer 2", "Run Python viewer 3"],
+      "dependsOn": [
+        "Run Godot publisher",
+        "Run Python viewer",
+        "Run Python viewer (camera1 duplicate)",
+        "Run Python viewer (camera2)",
+        "Run Python viewer (camera3)"
+      ],
       "dependsOrder": "parallel",
       "problemMatcher": []
     }

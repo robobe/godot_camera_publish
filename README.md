@@ -1,214 +1,143 @@
-# Godot camera → Python through shared memory
+# Godot → Python GPU memory sharing
 
-A Linux example with one animated 3D scene and **three 640×480 RGB8 cameras**, each with **90° horizontal FOV** (about 73.74° vertical) and a **30 FPS target**. Each Python viewer displays one camera with its own live **Received FPS** overlay. Godot also reports each camera's published FPS and average capture-plus-copy time. The frame-rate cap is set in `demo/project.godot`.
+This branch renders **three 640×480 cameras at 30 FPS with 90° horizontal FOV**, with four Python viewers. Camera 2 and camera 3 sit 1 m and 2 m to camera 1's right, with the same orientation. Viewers 1 and 4 subscribe to the same camera view (camera 1); they receive independent copies of its rendered texture and each has its own GPU buffers. Godot writes RGBA8 pixels into exportable Vulkan GPU buffers. Each Python process imports its allocations into CUDA. Pixel data does not travel through the control socket or CPU shared memory.
 
-Camera 2 is **1 metre to camera 1's right**; camera 3 is **2 metres to camera 1's right**. All three have the same orientation. Adjust `SECOND_CAMERA_OFFSET` and `THIRD_CAMERA_OFFSET` in `demo/main.gd` in camera 1's local coordinates (+X right, +Y up, -Z forward). All cameras share the same world and animation. Godot's preview shows camera 1.
+The Python OpenCV preview downloads the image from CUDA to CPU memory for display. Treat the shared input pixels as read-only. A CUDA application can instead consume `GpuFrame.device_pointer` on `receiver.cuda.stream`, then release the frame without downloading it.
 
 ## Build
 
-Requires Linux x86-64, Godot 4.5 or newer, Python 3 with NumPy and OpenCV, CMake, Ninja, Git, and a C++ compiler. NVIDIA rendering also requires a working NVIDIA driver and a graphical desktop session. Godot 4.7.2 and the RTX 5070 Laptop GPU were used for the local checks.
+Linux x86-64 and an NVIDIA GPU/driver supporting Vulkan external memory and external semaphore FDs are required. Both processes must use the same physical GPU. CUDA Toolkit / `nvcc` is not required: the consumer uses the CUDA driver API through NVIDIA's Python bindings.
 
-Run commands from the repository root. If the Python packages are missing, create and activate a virtual environment first:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-```
-
-Build the native shared-memory extension and import the Godot project:
+On Ubuntu 24.04, install the native build dependencies:
 
 ```bash
+sudo apt install build-essential cmake ninja-build pkg-config patch libvulkan-dev \
+  libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxi-dev \
+  libxkbcommon-dev libasound2-dev libpulse-dev libudev-dev
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python tools/build_gpu_engine.py --jobs 4
 cmake --preset debug
 cmake --build --preset debug
-godot --editor --path demo --import
 ```
 
-The first configure downloads pinned Godot 4.5 C++ bindings and builds a trimmed set of classes. The editor import command exits after import. Rebuild the extension after changing `src/shared_frame_buffer.cpp`.
+The engine build is pinned to Godot **4.5-stable**, commit `876b290332ec6f2e6d173d08162a02aa7e6ca46d`, matching the existing godot-cpp bindings. Its executable is `build/godot-src/bin/godot.linuxbsd.template_debug.x86_64`. It is a runtime template, without the editor. An initial source build takes several minutes and several GB of disk space.
+
+`patches/godot-gpu-sharing.patch` makes three changes:
+
+- Enables `VK_KHR_external_semaphore_fd` when supported. Godot already requests external memory FD support.
+- Adds `RenderingDevice.storage_buffer_create_from_extension(buffer, size)`, registering an externally owned Vulkan buffer with Godot's rendering graph. Godot frees its wrapper, while the extension owns the buffer and allocation.
+- Exposes `gpu_flush(false)` for shutdown, so queued compute work is submitted before external objects are destroyed.
+
+Stock Godot cannot run this demo's GPU exporter. The patch and extension intentionally support only Vulkan. Rendering is single threaded so the extension can submit to Godot's queue without racing the renderer. The main window viewport is disabled and camera frames are explicitly drawn without presentation. This avoids a measured 2 FPS NVIDIA/X11 presentation stall on this machine, while keeping the camera rendering at its 30 FPS cap. It still requires an X11 display and is not Godot's `--headless` mode.
 
 ## Run on NVIDIA
 
-Use four terminals in the repository root. Activate `.venv` in each Python terminal if you created it above.
-
-**Terminal 1 — Godot and all three camera publishers:**
+After building, start Godot once; it renders three camera views and publishes four GPU channels:
 
 ```bash
-__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia godot --path demo
+__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only \
+  build/godot-src/bin/godot.linuxbsd.template_debug.x86_64 --path demo
 ```
 
-These NVIDIA PRIME offload variables select NVIDIA for Godot's OpenGL Compatibility renderer. They apply to this Godot command; the Python viewers receive CPU image arrays and do not require NVIDIA offload.
-
-Verify the startup renderer line contains **`Using Device: NVIDIA`**. For example:
-
-```text
-OpenGL API 3.3.0 NVIDIA 580.178.04 - Compatibility - Using Device: NVIDIA - NVIDIA GeForce RTX 5070 Laptop GPU
-```
-
-The version numbers depend on the installed driver. A line naming Intel means that run is using Intel. `nvidia-smi` can show GPU activity and memory use, but the Godot renderer line confirms which GPU Godot selected.
-
-**Terminal 2 — camera 1:**
+Start one viewer per terminal. Viewers 1 and 4 show the same camera view through independent channels. A few seconds of 0 FPS during GPU/context startup are normal:
 
 ```bash
-python3 viewer.py
+.venv/bin/python -u viewer.py
+.venv/bin/python -u viewer.py --channel camera1_b
+.venv/bin/python -u viewer.py --channel camera2
+.venv/bin/python -u viewer.py --channel camera3
 ```
 
-**Terminal 3 — camera 2:**
+The first command defaults to `camera1_a`; run four viewer processes total. VS Code: run **Run camera demo (Godot + Python)**. It starts the already-built publisher and all four viewers in separate terminals without rebuilding. The publisher window is intentionally minimized; the visible camera GUIs are the OpenCV Python viewers. The **Godot publisher (background only)** debug configuration starts only Godot and does not open viewers. Run **Build GPU demo** explicitly after changing code or switching branches. Stop the publisher terminal with Ctrl+C. Press `q` or Escape in a Python window to close that preview. For a timed preview, use `viewer.py --seconds 10`.
 
-```bash
-python3 viewer.py --port 5002
-```
+CMake configuration registers the GDExtension in the local Godot cache, so the custom runtime can load it without an editor import. Rebuild after changing branches: ignored binaries and `.godot` caches are shared between checkouts.
 
-**Terminal 4 — camera 3:**
-
-```bash
-python3 viewer.py --port 5003
-```
-
-| Camera | Local TCP address | Offset from camera 1 | Pixel buffer |
-|---|---|---|---|
-| 1 | `127.0.0.1:5001` (default) | None | Own shared-memory segment |
-| 2 | `127.0.0.1:5002` | 1 metre right | Own shared-memory segment |
-| 3 | `127.0.0.1:5003` | 2 metres right | Own shared-memory segment |
-
-Window titles identify the camera port. Closing any viewer leaves the other cameras running.
-
-Press **Q**, **Escape**, or close the viewer window to exit. The viewer can start before Godot and reconnects if Godot restarts. Close Godot normally to release and unlink its shared-memory segment. Do not use Godot's `--headless`: it disables camera rendering. A display and working graphics driver are required.
-
-### VS Code
-
-After building and importing, choose **Terminal → Run Task → Run camera demo (Godot + Python)**. It launches Godot on NVIDIA and all three Python viewers in parallel, each in its own dedicated terminal. Individual publisher and viewer tasks are also available.
-
-**Ctrl+Shift+B** builds using the debug presets. **F5** builds and launches only Godot through GDB on NVIDIA; start the viewer tasks separately when debugging.
-
-The Godot task and debugger use `~/.local/bin/godot`; adjust `.vscode/tasks.json` and `.vscode/launch.json` if Godot is installed elsewhere. Viewer tasks use `python3`. If packages are installed only in `.venv`, change each viewer task's `command` to `${workspaceFolder}/.venv/bin/python`.
-
-## Data flow
-
-One Godot process renders the shared scene through three `SubViewport`s. Each viewport has a camera and a separate publisher from `demo/camera_publisher.gd`. The C++ extension writes pixels to Linux shared memory; each `viewer.py` process reads only its own camera.
-
-The diagrams use Mermaid. View this file on GitHub or in a Markdown preview with Mermaid support.
+## Flow and ownership
 
 ```mermaid
 flowchart LR
-    subgraph Godot["Godot process: NVIDIA rendering, CPU capture"]
-        World["Shared 3D world and animation"]
-        C1["Camera 1 / SubViewport"]
-        C2["Camera 2 / SubViewport"]
-        C3["Camera 3 / SubViewport"]
-        P1["Publisher 1: readback and RGB8"]
-        P2["Publisher 2: readback and RGB8"]
-        P3["Publisher 3: readback and RGB8"]
-        World --> C1 --> P1
-        World --> C2 --> P2
-        World --> C3 --> P3
-    end
-    M1[("Shared-memory slot 1")]
-    M2[("Shared-memory slot 2")]
-    M3[("Shared-memory slot 3")]
-    V1["Python viewer 1: NumPy, FPS, display"]
-    V2["Python viewer 2: NumPy, FPS, display"]
-    V3["Python viewer 3: NumPy, FPS, display"]
-    P1 -->|Write pixels| M1 -->|Copy pixels| V1
-    P2 -->|Write pixels| M2 -->|Copy pixels| V2
-    P3 -->|Write pixels| M3 -->|Copy pixels| V3
-    P1 <-->|TCP 5001: handshake, READY, ACK| V1
-    P2 <-->|TCP 5002: handshake, READY, ACK| V2
-    P3 <-->|TCP 5003: handshake, READY, ACK| V3
+    Cameras[Three Godot camera textures on GPU] --> Copies[Four GPU compute copies, camera 1 duplicated]
+    Copies --> Slots[Four independent three-slot Vulkan buffer sets]
+    Slots --> CUDA[Four Python CUDA subscribers]
+    CUDA --> Work[CUDA processing on each receiver stream]
+    Work --> Download[Each preview downloads to pinned CPU memory]
+    Download --> Display[Four OpenCV viewer windows with received FPS]
+    Godot[Godot publisher] <-->|Four Unix channels, setup FDs and frame ownership| Python[Four Python receivers]
 ```
 
-The two communication paths serve different purposes:
-
-- **Shared memory carries pixels:** one tightly packed `480 × 640 × 3` RGB8 array per camera, **921,600 bytes**.
-- **Localhost TCP carries control messages:** the initial buffer description, a **READY** notification, and an **ACK** acknowledgment. Image pixels never pass through TCP.
-
-Readback means transferring the rendered image from GPU storage to CPU-accessible memory. Shared memory avoids sending those pixels through a socket, but GPU readback, RGB conversion, and CPU copies still occur.
-
-## Signaling sequence
-
-This sequence runs independently for each camera. **Python knows a new frame is available when the socket becomes readable and it has received a complete READY message.** It does not poll shared-memory pixels or watch a file for changes.
+Godot schedules a compute copy after a rendered frame. That dispatch is submitted with the next rendered frame. On the next post-draw callback, a native queue submission releases the output buffer to external ownership and signals its exported binary semaphore. The copy operates on the camera texture through Godot's rendering graph, which handles its image layout and resource dependencies.
 
 ```mermaid
 sequenceDiagram
-    participant G as Godot camera publisher
-    participant M as Shared-memory slot
-    participant V as Python viewer
-
-    G->>M: Create buffer, 921600 bytes, mode 0600
-    G->>G: Listen on this camera's localhost port
-    V->>G: Connect TCP
-    G-->>V: Handshake: JSON length and buffer metadata
-    V->>V: Validate format, size, name, and ownership
-    V->>M: Open read-only mmap
-
-    loop Each rendered frame, target 30 FPS
-        alt No viewer or slot unavailable
-            G->>G: Skip publication and keep rendering
-        else Connected and slot free
-            G->>G: After frame_post_draw, read back and convert to RGB8
-            G->>M: Copy pixels into shared slot
-            G-->>V: READY: frame_id and capture_usec
-            Note over G,M: Keep this slot unchanged until matching ACK
-            V->>M: Read and copy pixels into a private NumPy array
-            V-->>G: ACK: copied frame_id
-            par Viewer processes its private copy
-                V->>V: Convert RGB to BGR, update FPS, display
-            and Publisher handles acknowledgment
-                G->>G: Poll TCP and validate the complete ACK
-                G->>G: Mark slot free for a newly captured frame
-            end
-        end
+    participant G as Godot / Vulkan
+    participant S as Unix control socket
+    participant P as Python / CUDA
+    G->>S: Setup, layout and GPU UUID, 6 FDs via SCM_RIGHTS
+    S->>P: Import 3 memory allocations and 3 ready semaphores
+    loop Each frame with a free slot
+        G->>G: Acquire free slot, schedule GPU copy
+        G->>G: Next render submits copy
+        G->>G: Queue release barrier and signal Vulkan ready semaphore
+        G->>S: READY, slot, frame ID, capture timestamp
+        S->>P: Frame metadata only, no image bytes
+        P->>P: CUDA stream waits on imported semaphore
+        P->>P: Read shared GPU buffer, optionally copy to host
+        P->>P: Synchronize CUDA stream after all reads finish
+        P->>S: RELEASE, slot and matching frame ID
+        S->>G: Slot available for reuse
     end
 ```
 
-Godot handles TCP without blocking its render loop. While awaiting ACK, it skips new publications for that camera. Python uses nonblocking socket reads and `select` between OpenCV window updates. Partial TCP messages are retained until complete; a partly sent ACK is retried, and Godot frees the slot only after receiving the full matching frame ID.
+Each slot moves through `FREE → GODOT WRITING → READY → PYTHON READING → FREE`. The setup socket passes each channel's Vulkan allocation and ready-semaphore file descriptors to its viewer once with `SCM_RIGHTS`; later socket messages carry only a slot index, frame ID, and timestamp. Godot queues the copy and release barrier on the same Vulkan queue. The `READY` packet can arrive before that GPU work has finished, so the viewer does not treat the packet as pixel readiness: it queues a wait on the imported Vulkan semaphore in its CUDA stream before accessing the buffer.
 
-**The copy must finish before ACK.** `numpy.frombuffer()` alone creates a view into the shared slot. The receiver calls `.copy()` so Godot can overwrite the shared buffer after ACK while Python safely converts and displays its private image. ACK means “pixels copied,” not “image displayed.”
+The viewer keeps the slot until its CUDA work finishes. In the OpenCV path, it queues a GPU-to-host copy, synchronizes that CUDA stream, then sends `RELEASE` with the same slot and frame ID. The CUDA wait consumes the slot's binary semaphore signal, so Vulkan can signal that semaphore again on a later reuse. The release packet is the reverse ownership handoff: it is sent only after the CUDA stream has finished reading the allocation, and Godot validates its slot and frame ID before making the slot writable again. For a CUDA inference path, enqueue the inference on `receiver.cuda.stream` and call `receiver.release(frame)` only after the stream work is complete; `release()` synchronizes before sending the acknowledgement. If all three slots are held, Godot drops that capture instead of blocking the render thread. Each channel has its own frame IDs and slot pool; the two camera-1 viewers receive independent copies, not one multi-reader allocation. The FPS overlay counts completed downloads, while Godot reports submitted and dropped captures. The timestamp marks capture scheduling, not exposure time or end-to-end display latency.
 
-| Slot state | Godot | Python |
-|---|---|---|
-| Free, before READY | May write the next captured image | Waits for READY |
-| Published, awaiting ACK | Leaves pixels unchanged; skips new publications | Copies pixels, then acknowledges |
+Each publisher uses a Linux abstract Unix socket `\0godot-camera-gpu-<uid>-<channel>`, with `SOCK_SEQPACKET` message boundaries. The channels are `camera1_a`, `camera1_b`, `camera2` and `camera3`. Both ends verify the peer's UID. One subscriber is accepted per channel; camera 1's two channels get independent buffer sets to avoid cross-viewer ownership races. Abstract sockets disappear automatically on process exit. Descriptors are passed during setup using `SCM_RIGHTS`, not as integer values in a message.
 
-No semaphore, shared frame-counter polling, or `mmap.flush()` is used. Buffer ownership is coordinated through the ordered socket messages. This keeps a single frame in flight per camera instead of building a queue of old images.
+Setup is little endian `<4s5I16s3Q>`: `GPG1`, version 1, width, height, slot count, payload bytes, GPU UUID, and three allocation sizes. Its six FDs alternate memory and ready semaphore for each slot. READY is `<4sIIQQ>`: `RDY1`, slot, startup-pattern flag, frame ID, timestamp in monotonic microseconds. RELEASE is `<4sIQ>`: `REL1`, slot, matching frame ID. Invalid packets disconnect the consumer. Each channel holds about 3.52 MiB of pixel buffers; the four channels hold about 14.1 MiB total, plus allocation alignment and driver overhead.
 
-Each camera has its own publisher (`demo/camera_publisher.gd`), shared-memory slot, socket, and ACK state. A slow or disconnected viewer does not hold the other camera's slot. This is a single-slot example per camera, not a queue. `frame_id` advances every rendered frame, so gaps are expected when frames are skipped. All publishers count the same render events, but independently skipped frames mean the viewers are not guaranteed to display matching IDs. The notification timestamp is Godot's monotonic microsecond clock sampled before each camera's readback; it is not wall time and should not be subtracted directly from Python's clock.
+## Using the GPU pointer
 
-Each publisher owns its POSIX shared-memory segment (mode `0600`). Python opens its `/dev/shm` file read-only using `mmap`, so it does not create a Python shared-memory resource tracker that could unlink the producer's buffer. Only one local consumer per camera is supported.
+```python
+from gpu_receiver import GpuReceiver
 
-If a viewer disconnects, its publisher resets that connection's state and accepts a new connection with a fresh handshake. The other publishers continue independently. A connected viewer that stops acknowledging holds only its own camera's slot. Viewers retry connections if Godot is unavailable or restarts. On normal Godot shutdown, each publisher unmaps and unlinks its segment.
-
-### Wire format
-
-All integers are unsigned, little-endian. TCP reads/writes may be partial; both sides retain incomplete messages.
-
-1. **Handshake:** `uint32` JSON byte length (at most 1024), followed by UTF-8 JSON: `version=1`, `shm`, `width=640`, `height=480`, `format="RGB8"`, `bytes=921600`.
-2. **READY:** `uint64 frame_id`, `uint64 capture_usec` (16 bytes).
-3. **ACK:** matching `uint64 frame_id` (8 bytes), sent only after the pixel copy completes.
-
-READY transfers ownership to Python; ACK transfers it back. No shared-memory polling, cross-process Python lock, or `mmap.flush()` is needed. The socket notification follows the completed write on this Linux setup. The shared-memory name and frame storage are fresh for each Godot run; each connection starts with a handshake.
-
-## FPS and performance
-
-The Python overlay counts complete frame copies over the actual elapsed monotonic time, updating about once per second. It does **not** count window refreshes. It shows “Waiting for frames” before the first image and “No frames” after one second without a new image. FPS falls to zero during idle periods.
-
-The pipeline still includes **GPU → CPU readback**, conversion to RGB8, one copy into shared memory, and one copy into Python-owned storage per camera. The private Python copy lets the producer safely reuse the slot while Python converts and displays the image. Each frame is **921,600 bytes**, with raw pixel traffic of about **27.6 MB/s per camera at 30 FPS**, or **82.9 MB/s for all three cameras**; the copies add memory traffic. RGB8 has no alpha channel, and uses 25% less payload space than RGBA8. Rebuild the extension and restart Godot and the viewers when updating from the RGBA8 version; the viewer rejects the old format.
-
-Godot targets 30 FPS; this is not a real-time guarantee. Readback, rendering, socket round trips, the display refresh rate, and Python processing can reduce delivery FPS. Keep the viewer visible when comparing rates.
-
-## Checks
-
-```bash
-python3 -m unittest discover -s tests -v
+receiver = GpuReceiver.connect()
+try:
+    # Wait for socket readability in a real event loop.
+    frame = receiver.acquire()
+    if frame is not None:
+        # RGBA8, row pitch 640*4, device pointer is frame.device_pointer.
+        # Enqueue CUDA work on receiver.cuda.stream after its ready wait.
+        # Do not retain the pointer after release or use it on another stream
+        # without explicit cross-stream dependencies.
+        receiver.release(frame)  # Synchronizes the stream before acknowledging.
+finally:
+    receiver.close()
 ```
 
-Tests cover FPS timing and idle reset, fragmented notifications, copy-before-ACK ownership, invalid metadata and buffer sizes, duplicate frame IDs, and disconnects.
+The receiver owns a CUDA context on the creating thread. Use it from that thread. Passing its pointer directly into an inference framework requires additional context and tensor-lifetime integration.
 
-For a rendered integration check (requires a display, a built/imported demo, and free ports 5001, 5002, and 5003):
+The first three published frames are a GPU-generated coordinate pattern. The preview verifies every byte, checking shared memory access, channel order and orientation before showing the animated camera. These are diagnostic frames, not camera images.
+
+## Checks and limitations
 
 ```bash
-__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia python3 tests/check_pipeline.py
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+.venv/bin/python tests/check_pipeline.py
+.venv/bin/python tests/benchmark_gpu_sharing.py --seconds 30 --warmup 3
 ```
 
-The integration check launches Godot, compares different camera views at matching frame IDs, checks RGB images, pauses readers to verify buffer ownership and independence, reconnects, measures all three cameras' FPS, and verifies all three shared-memory segments are removed. It does not launch the OpenCV viewers.
+The single-channel integration check verifies slot ownership, reconnects, malformed messages and real changing pixels. The benchmark runs three cameras with four OpenCV viewers for 30 seconds after warmup and records per-process CPU/RSS plus whole-device NVIDIA utilization/VRAM. Its raw samples and process logs go under ignored `build/`. For a shorter four-viewer smoke check (opens four preview windows and runs for 10 seconds):
 
-This example deliberately skips compression, multiple buffer slots, and asynchronous GPU readback. The socket is local-only but does not authenticate other processes running as the same user. Termination signals (including terminal Ctrl+C) can bypass scene cleanup; an orphan named `godot_camera_<PID>_<timestamp>` may remain in `/dev/shm` after interruption and can be removed once that publisher is gone. Close the Godot window normally to clean up automatically.
+```bash
+.venv/bin/python tests/check_multi_viewer.py
+```
+
+It reports each viewer's received FPS and writes logs under ignored `build/`.
+
+A disconnected consumer's allocation generation is retired and never reused. **Retired generations remain allocated until publisher shutdown**, preserving allocations an old consumer may still access. Repeated reconnects therefore grow GPU memory use. This prototype needs bounded retirement and stronger crash recovery before long-running production use.
+
+The three-camera/four-viewer configuration was measured for 30 seconds on the NVIDIA GeForce RTX 5070 Laptop GPU with driver 580.178.04. See [PERFORMANCE.md](PERFORMANCE.md) for the combined results and comparison with the other transports.
+
+This is a trusted same-user demo with one consumer per channel. It duplicates camera 1's GPU copy for its second viewer instead of implementing multi-consumer slot acknowledgements. It does not implement inference frameworks or direct GPU display. Restart the publisher after a GPU/driver fault. No performance improvement over the other branches is claimed without a controlled benchmark.

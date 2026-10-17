@@ -1,1 +1,1 @@
-{"enabled_classes": ["RefCounted", "OS"]}
+{"enabled_classes": ["RefCounted", "OS", "RenderingServer", "RenderingDevice", "RDShaderSource", "RDShaderSPIRV", "RDUniform", "RDSamplerState", "RDPipelineSpecializationConstant"]}

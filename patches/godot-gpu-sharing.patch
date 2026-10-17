@@ -1,0 +1,99 @@
+--- a/servers/rendering/rendering_device_driver.h
++++ b/servers/rendering/rendering_device_driver.h
+@@ -173,6 +173,7 @@
+ 		BUFFER_WHOLE_SIZE = ~0ULL
+ 	};
+ 
++	virtual BufferID buffer_create_from_extension(uint64_t p_buffer, uint32_t p_size) { return BufferID(); }
+ 	virtual BufferID buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type) = 0;
+ 	// Only for a buffer with BUFFER_USAGE_TEXEL_BIT.
+ 	virtual bool buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) = 0;
+--- a/drivers/vulkan/rendering_device_driver_vulkan.h
++++ b/drivers/vulkan/rendering_device_driver_vulkan.h
+@@ -197,6 +197,7 @@
+ 	};
+ 
+ 	virtual BufferID buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type) override final;
++	virtual BufferID buffer_create_from_extension(uint64_t p_buffer, uint32_t p_size) override final;
+ 	virtual bool buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) override final;
+ 	virtual void buffer_free(BufferID p_buffer) override final;
+ 	virtual uint64_t buffer_get_allocation_size(BufferID p_buffer) override final;
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -537,6 +537,7 @@
+ 	// We don't actually use this extension, but some runtime components on some platforms
+ 	// can and will fill the validation layers with useless info otherwise if not enabled.
+ 	_register_requested_device_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, false);
++	_register_requested_device_extension(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME, false);
+ 
+ 	if (Engine::get_singleton()->is_generate_spirv_debug_info_enabled()) {
+ 		_register_requested_device_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, true);
+@@ -1707,6 +1708,14 @@
+ 	return BufferID(buf_info);
+ }
+ 
++RDD::BufferID RenderingDeviceDriverVulkan::buffer_create_from_extension(uint64_t p_buffer, uint32_t p_size) {
++	BufferInfo *info = VersatileResource::allocate<BufferInfo>(resources_allocator);
++	info->vk_buffer = (VkBuffer)p_buffer;
++	info->size = p_size;
++	info->allocation.size = p_size;
++	return BufferID(info);
++}
++
+ bool RenderingDeviceDriverVulkan::buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) {
+ 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
+ 
+@@ -1730,6 +1739,11 @@
+ 		vkDestroyBufferView(vk_device, buf_info->vk_view, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_BUFFER_VIEW));
+ 	}
+ 
++	if (!buf_info->allocation.handle) {
++		// The extension owns imported buffers and their memory.
++		VersatileResource::free(resources_allocator, buf_info);
++		return;
++	}
+ 	if (!Engine::get_singleton()->is_extra_gpu_memory_tracking_enabled()) {
+ 		vmaDestroyBuffer(allocator, buf_info->vk_buffer, buf_info->allocation.handle);
+ 	} else {
+--- a/servers/rendering/rendering_device.h
++++ b/servers/rendering/rendering_device.h
+@@ -981,6 +981,7 @@
+ 		return uniform_buffer_create(p_size_bytes, p_data, p_creation_bits);
+ 	}
+ 
++	RID storage_buffer_create_from_extension(uint64_t p_buffer, uint32_t p_size);
+ 	RID storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data = {}, BitField<StorageBufferUsage> p_usage = 0, BitField<BufferCreationBits> p_creation_bits = 0);
+ 	RID _storage_buffer_create(uint32_t p_size_bytes, const Vector<uint8_t> &p_data, BitField<StorageBufferUsage> p_usage = 0, BitField<BufferCreationBits> p_creation_bits = 0) {
+ 		return storage_buffer_create(p_size_bytes, p_data, p_usage, p_creation_bits);
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -780,6 +780,20 @@
+ 	ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), 0, "Buffer was not created with device address flag.");
+ 
+ 	return driver->buffer_get_device_address(buffer->driver_id);
++}
++
++RID RenderingDevice::storage_buffer_create_from_extension(uint64_t p_buffer, uint32_t p_size) {
++	ERR_RENDER_THREAD_GUARD_V(RID());
++	ERR_FAIL_COND_V(p_buffer == 0 || p_size == 0, RID());
++	Buffer buffer;
++	buffer.size = p_size;
++	buffer.usage = RDD::BUFFER_USAGE_STORAGE_BIT;
++	buffer.driver_id = driver->buffer_create_from_extension(p_buffer, p_size);
++	ERR_FAIL_COND_V(!buffer.driver_id, RID());
++	buffer.draw_tracker = RDG::resource_tracker_create();
++	buffer.draw_tracker->buffer_driver_id = buffer.driver_id;
++	buffer_memory += buffer.size;
++	return storage_buffer_owner.make_rid(buffer);
+ }
+ 
+ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data, BitField<StorageBufferUsage> p_usage, BitField<BufferCreationBits> p_creation_bits) {
+@@ -7394,6 +7408,8 @@
+ 	ClassDB::bind_method(D_METHOD("shader_get_vertex_input_attribute_mask", "shader"), &RenderingDevice::shader_get_vertex_input_attribute_mask);
+ 
+ 	ClassDB::bind_method(D_METHOD("uniform_buffer_create", "size_bytes", "data", "creation_bits"), &RenderingDevice::_uniform_buffer_create, DEFVAL(Vector<uint8_t>()), DEFVAL(0));
++	ClassDB::bind_method(D_METHOD("gpu_flush", "present"), &RenderingDevice::swap_buffers, DEFVAL(false));
++	ClassDB::bind_method(D_METHOD("storage_buffer_create_from_extension", "buffer", "size"), &RenderingDevice::storage_buffer_create_from_extension);
+ 	ClassDB::bind_method(D_METHOD("storage_buffer_create", "size_bytes", "data", "usage", "creation_bits"), &RenderingDevice::_storage_buffer_create, DEFVAL(Vector<uint8_t>()), DEFVAL(0), DEFVAL(0));
+ 	ClassDB::bind_method(D_METHOD("texture_buffer_create", "size_bytes", "format", "data"), &RenderingDevice::_texture_buffer_create, DEFVAL(Vector<uint8_t>()));
+ 
