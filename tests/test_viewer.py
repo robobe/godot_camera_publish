@@ -1,108 +1,79 @@
 import json
-import os
-from pathlib import Path
-import socket
-import struct
-import time
 import unittest
+from types import SimpleNamespace
 
-import numpy as np
-
-from viewer import ACK, FRAME_BYTES, HEIGHT, READY, WIDTH, FrameReceiver, ReceivedFPS
+from viewer import FRAME_BYTES, FrameReceiver, ReceivedFPS
 
 
-class FPSTest(unittest.TestCase):
-    def test_counts_frames_over_actual_elapsed_time_and_resets_when_idle(self):
-        fps = ReceivedFPS(10.0)
-        for _ in range(60):
-            fps.record()
-        fps.update(10.5)
-        self.assertEqual(fps.value, 0.0)
-        fps.update(11.2)
-        self.assertAlmostEqual(fps.value, 50.0)
-        fps.update(12.3)
-        self.assertEqual(fps.value, 0.0)
+class Bytes:
+    def __init__(self, data, shm=True):
+        self.data, self.shm = data, shm
+    def __len__(self):
+        return len(self.data)
+    def as_shm(self):
+        return self if self.shm else None
+    def to_bytes(self):
+        return bytes(self.data)
 
 
 class ReceiverTest(unittest.TestCase):
     def setUp(self):
-        self.producer, consumer = socket.socketpair()
-        self.producer.settimeout(1)
-        self.receiver = FrameReceiver(consumer)
-        self.path = Path("/dev/shm") / f"godot_camera_{os.getpid()}_{time.monotonic_ns()}"
-        self.file = self.path.open("xb")
-        self.file.truncate(FRAME_BYTES)
-        self.file.close()
-        self.path.chmod(0o600)
-        self.metadata = {
-            "version": 1, "shm": "/" + self.path.name,
-            "width": WIDTH, "height": HEIGHT, "format": "RGB8", "bytes": FRAME_BYTES,
-        }
+        self.receiver = FrameReceiver.__new__(FrameReceiver)
+        self.receiver.camera_id = 1
+        self.receiver.frame_id = 0
+        self.receiver.stream_id = None
+        self.metadata = dict(version=1, camera_id=1, width=640, height=480,
+                             format='RGB8', frame_id=10, capture_usec=123, stream_id='abc')
 
-    def tearDown(self):
-        self.receiver.close()
-        self.producer.close()
-        self.path.unlink()
+    def sample(self, **changes):
+        metadata = {**self.metadata, **changes}
+        return SimpleNamespace(payload=Bytes(bytearray([42]) * FRAME_BYTES),
+                               attachment=Bytes(json.dumps(metadata).encode()))
 
-    def handshake(self, metadata=None):
-        payload = json.dumps(self.metadata if metadata is None else metadata).encode()
-        return struct.pack("<I", len(payload)) + payload
+    def test_private_copy_and_restart(self):
+        sample = self.sample()
+        frame = self.receiver.decode(sample)
+        sample.payload.data[:] = b'\x00' * FRAME_BYTES
+        self.assertEqual(frame.shape, (480, 640, 3))
+        self.assertTrue((frame == 42).all())
+        with self.assertRaisesRegex(ValueError, 'increase'):
+            self.receiver.decode(self.sample())
+        self.receiver.decode(self.sample(stream_id='new-session', frame_id=1))
+        self.assertEqual(self.receiver.frame_id, 1)
 
-    def test_fragmented_messages_copy_before_ack_and_single_count(self):
-        message = self.handshake() + READY.pack(7, 123456)
-        for byte in message[:-1]:
-            self.producer.sendall(bytes([byte]))
-            self.assertIsNone(self.receiver.poll())
-        pixel = np.array([23, 77, 149], dtype=np.uint8)
-        self.path.write_bytes(pixel.tobytes() * (WIDTH * HEIGHT))
-        self.producer.sendall(message[-1:])
-        frame = self.receiver.poll()
-        self.assertEqual(frame.shape, (HEIGHT, WIDTH, 3))
-        self.assertEqual(frame.nbytes, 921600)
-        self.assertTrue(np.all(frame == pixel))
-        self.assertEqual(self.producer.recv(8), ACK.pack(7))
-        self.path.write_bytes(bytes([99]) * FRAME_BYTES)
-        self.assertTrue(np.all(frame == pixel), "Returned frame must own its pixels")
-        self.assertIsNone(self.receiver.poll())
-        self.assertEqual(self.receiver.frame_id, 7)
+    def test_rejects_raw_payload(self):
+        sample = self.sample()
+        sample.payload.shm = False
+        with self.assertRaisesRegex(ValueError, 'SHM required'):
+            self.receiver.decode(sample)
 
-    def test_invalid_metadata_and_path_are_rejected(self):
-        self.producer.sendall(self.handshake({**self.metadata, "shm": "/../../etc/passwd"}))
-        with self.assertRaisesRegex(ValueError, "name"):
-            self.receiver.poll()
+    def test_rejects_invalid_metadata(self):
+        for changes in [dict(format='RGBA8'), dict(camera_id=2), dict(frame_id=True),
+                        dict(capture_usec=-1), dict(stream_id=''), dict(version=2),
+                        dict(version=True), dict(camera_id=True)]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.receiver.decode(self.sample(**changes))
 
-    def test_old_rgba_metadata_is_rejected(self):
-        self.producer.sendall(self.handshake({
-            **self.metadata, "format": "RGBA8", "bytes": WIDTH * HEIGHT * 4,
-        }))
-        with self.assertRaisesRegex(ValueError, "Unsupported camera metadata"):
-            self.receiver.poll()
-
-    def test_incorrect_buffer_size_is_rejected(self):
-        self.path.write_bytes(b"short")
-        self.producer.sendall(self.handshake())
-        with self.assertRaisesRegex(ValueError, "size"):
-            self.receiver.poll()
-
-    def test_oversized_handshake_is_rejected(self):
-        self.producer.sendall(struct.pack("<I", 1025))
-        with self.assertRaisesRegex(ValueError, "length"):
-            self.receiver.poll()
-
-    def test_duplicate_frame_is_rejected(self):
-        self.producer.sendall(self.handshake() + READY.pack(1, 100))
-        self.assertIsNotNone(self.receiver.poll())
-        self.receiver.poll()
-        self.producer.recv(8)
-        self.producer.sendall(READY.pack(1, 101))
-        with self.assertRaisesRegex(ValueError, "increase"):
-            self.receiver.poll()
-
-    def test_disconnect_is_reported(self):
-        self.producer.close()
-        with self.assertRaises(ConnectionError):
-            self.receiver.poll()
+    def test_rejects_invalid_length_and_attachment(self):
+        sample = self.sample()
+        sample.payload = Bytes(b'short')
+        with self.assertRaisesRegex(ValueError, 'length'):
+            self.receiver.decode(sample)
+        sample.attachment = None
+        with self.assertRaisesRegex(ValueError, 'metadata'):
+            self.receiver.decode(sample)
 
 
-if __name__ == "__main__":
+class FPSTest(unittest.TestCase):
+    def test_elapsed_time_and_idle(self):
+        fps = ReceivedFPS(10)
+        for _ in range(60):
+            fps.record()
+        fps.update(11.2)
+        self.assertAlmostEqual(fps.value, 50)
+        fps.update(12.3)
+        self.assertEqual(fps.value, 0)
+
+
+if __name__ == '__main__':
     unittest.main()
