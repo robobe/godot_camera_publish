@@ -1,4 +1,4 @@
-"""Real NVIDIA Godot -> Zenoh SHM integration. Run with .venv/bin/python."""
+"""Real NVIDIA Godot -> Zenoh UDP integration. Run with .venv/bin/python."""
 import os
 from pathlib import Path
 import subprocess
@@ -41,7 +41,7 @@ def main():
     process = log = None
     try:
         assert all(r.poll() is None for r in receivers), 'Subscriber-first must be nonblocking'
-        process, log = start('integration-zenoh.log', 600)
+        process, log = start('integration-udp.log', 600)
         results = collect(receivers, 12)
         assert all(len(r) >= 30 for r in results), [len(r) for r in results]
         common = set(results[0]).intersection(*results[1:])
@@ -57,34 +57,16 @@ def main():
         before = receivers[1].frame_id
         collect(receivers[1:], 1)
         assert receivers[1].frame_id > before, 'Closed subscriber blocked the others'
-        # Retain actual SHM samples deliberately until the bounded publisher pool fills.
-        held = []
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            sample = receivers[1].subscriber.try_recv()
-            if sample is not None:
-                assert sample.payload.as_shm() is not None
-                held.append(sample)
-            time.sleep(.003)
-        assert 20 <= len(held) <= 36, f'Expected bounded pool, retained {len(held)} frames'
-        assert any(
-            int(line.split('Dropped: ')[1].split(' |')[0]) > 0
-            for line in (ROOT / 'build/integration-zenoh.log').read_text().splitlines() if 'Dropped:' in line)
-        held.clear()
-        sample = None
-        before = receivers[1].frame_id
-        collect(receivers[1:], 1)
-        assert receivers[1].frame_id > before, 'Pool did not recover after samples were released'
         process.wait(timeout=10)
         log.close()
         assert process.returncode == 0
-        process, log = start('integration-zenoh-restart.log', 330)
+        process, log = start('integration-udp-restart.log', 330)
         collect(receivers[1:], 10)
         assert all(r.stream_id != old_stream for r in receivers[1:]), 'Restart did not reconnect'
         process.wait(timeout=5)
         log.close()
         assert process.returncode == 0
-        print('PASS: native SHM, subscriber-first, three camera offsets, duplicate subscriber pixels, slow/closed subscriber, bounded pool exhaustion/recovery, publisher restart')
+        print('PASS: UDP payloads, subscriber-first, three camera offsets, duplicate subscriber pixels, slow/closed subscriber, publisher restart')
     finally:
         for receiver in receivers[1:]:
             receiver.close()

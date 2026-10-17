@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Display a local Zenoh SHM RGB8 camera stream."""
+"""Display a local Zenoh UDP RGB8 camera stream."""
 import argparse
 import json
 import os
@@ -33,7 +33,7 @@ class ReceivedFPS:
 
 
 class FrameReceiver:
-    """Latest-only subscriber; Zenoh owns SHM until the sample is released."""
+    """Latest-only subscriber for complete Zenoh UDP image samples."""
 
     def __init__(self, camera_id=1):
         if camera_id not in (1, 2, 3):
@@ -46,10 +46,12 @@ class FrameReceiver:
         config = zenoh.Config()
         for key, value in {
             "mode": '"peer"', "listen/endpoints": "[]",
-            "connect/endpoints": '["tcp/127.0.0.1:7447"]',
+            "connect/endpoints": '["udp/127.0.0.1:7447"]',
             "connect/timeout_ms": "-1", "connect/exit_on_failure": "false",
             "scouting/multicast/enabled": "false",
-            "transport/shared_memory/enabled": "true",
+            "transport/shared_memory/enabled": "false",
+            "transport/link/protocols": '["udp"]',
+            "transport/link/tx/batch_size": "8192",
         }.items():
             config.insert_json5(key, value)
         self.session = zenoh.open(config)
@@ -57,8 +59,8 @@ class FrameReceiver:
             f"godot/camera/{camera_id}/image", zenoh.handlers.RingChannel(1))
 
     def decode(self, sample):
-        if sample.payload.as_shm() is None:
-            raise ValueError("Local SHM required: received a raw/network payload")
+        if sample.payload.as_shm() is not None:
+            raise ValueError("UDP images required: received an unexpected SHM payload")
         if sample.attachment is None or len(sample.attachment) > 1024:
             raise ValueError("Missing or oversized camera metadata")
         metadata = json.loads(sample.attachment.to_bytes())
@@ -73,11 +75,11 @@ class FrameReceiver:
                 or type(frame_id) is not int or frame_id <= 0
                 or type(capture_usec) is not int or capture_usec < 0):
             raise ValueError("Invalid frame identity or timestamp")
-        if stream_id == self.stream_id and frame_id <= self.frame_id:
-            raise ValueError("Frame IDs must increase within a publisher session")
         if len(sample.payload) != FRAME_BYTES:
             raise ValueError("Invalid RGB8 payload length")
-        # Python Zenoh has no SHM buffer protocol: this private copy releases SHM promptly.
+        if stream_id == self.stream_id and frame_id <= self.frame_id:
+            return None
+        # Own the image independently of Zenoh samples and their receive buffers.
         pixels = sample.payload.to_bytes()
         self.stream_id, self.frame_id = stream_id, frame_id
         self.capture_usec = capture_usec
@@ -104,13 +106,13 @@ def draw_overlay(image, fps, status, frame_id):
 
 
 def main(camera_id=1):
-    window = f"Godot camera {camera_id} ({os.getpid()}) - Q / Esc to quit"
+    window = f"Godot UDP camera {camera_id} ({os.getpid()}) - Q / Esc to quit"
     receiver = FrameReceiver(camera_id)
     fps = ReceivedFPS(time.monotonic())
     image = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
     last_report = time.monotonic()
     cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
-    print(f"Subscribed to godot/camera/{camera_id}/image; local SHM required", flush=True)
+    print(f"Subscribed to godot/camera/{camera_id}/image; UDP best effort, SHM disabled", flush=True)
     try:
         while True:
             frame = receiver.poll()
@@ -121,7 +123,7 @@ def main(camera_id=1):
             fps.update(now)
             status = "Waiting for frames"
             if receiver.last_frame_time is not None:
-                status = "Live (SHM)" if now - receiver.last_frame_time < 1.0 else "No frames"
+                status = "Live (UDP)" if now - receiver.last_frame_time < 1.0 else "No frames"
             cv2.imshow(window, draw_overlay(image, fps.value, status, receiver.frame_id))
             if now - last_report >= 1.0:
                 print(f"Received FPS: {fps.value:.1f} | {status} | Frame: {receiver.frame_id}", flush=True)

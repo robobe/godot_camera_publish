@@ -6,7 +6,7 @@ from viewer import FRAME_BYTES, FrameReceiver, ReceivedFPS
 
 
 class Bytes:
-    def __init__(self, data, shm=True):
+    def __init__(self, data, shm=False):
         self.data, self.shm = data, shm
     def __len__(self):
         return len(self.data)
@@ -36,15 +36,22 @@ class ReceiverTest(unittest.TestCase):
         sample.payload.data[:] = b'\x00' * FRAME_BYTES
         self.assertEqual(frame.shape, (480, 640, 3))
         self.assertTrue((frame == 42).all())
-        with self.assertRaisesRegex(ValueError, 'increase'):
-            self.receiver.decode(self.sample())
+        self.assertIsNone(self.receiver.decode(self.sample()))
         self.receiver.decode(self.sample(stream_id='new-session', frame_id=1))
         self.assertEqual(self.receiver.frame_id, 1)
 
-    def test_rejects_raw_payload(self):
+    def test_stale_frames_do_not_reset_state(self):
+        self.receiver.decode(self.sample())
+        last_time = self.receiver.last_frame_time
+        self.assertIsNone(self.receiver.decode(self.sample(frame_id=9)))
+        self.assertEqual(self.receiver.frame_id, 10)
+        self.assertEqual(self.receiver.last_frame_time, last_time)
+        self.assertIsNotNone(self.receiver.decode(self.sample(frame_id=12)))
+
+    def test_rejects_shm_payload(self):
         sample = self.sample()
-        sample.payload.shm = False
-        with self.assertRaisesRegex(ValueError, 'SHM required'):
+        sample.payload.shm = True
+        with self.assertRaisesRegex(ValueError, 'unexpected SHM'):
             self.receiver.decode(sample)
 
     def test_rejects_invalid_metadata(self):
