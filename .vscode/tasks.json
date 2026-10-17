@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {"label": "Configure debug", "type": "process", "command": "cmake", "args": ["--preset", "debug"], "problemMatcher": []},
+    {"label": "Build debug", "type": "process", "command": "cmake", "args": ["--build", "--preset", "debug"], "dependsOn": "Configure debug", "group": {"kind": "build", "isDefault": true}, "problemMatcher": ["$gcc"]},
+    {
+      "label": "Run Godot publisher",
+      "type": "process",
+      "command": "${env:HOME}/.local/bin/godot",
+      "args": ["--path", "${workspaceFolder}/demo"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {"__NV_PRIME_RENDER_OFFLOAD": "1", "__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
+      },
+      "presentation": {"panel": "dedicated", "reveal": "always"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Python viewer",
+      "type": "process",
+      "command": "python3",
+      "args": ["-u", "${workspaceFolder}/viewer.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "presentation": {"panel": "dedicated", "reveal": "always"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Python viewer 2",
+      "type": "process",
+      "command": "python3",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--port", "5002"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "presentation": {"panel": "dedicated", "reveal": "always"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Python viewer 3",
+      "type": "process",
+      "command": "python3",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--port", "5003"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "presentation": {"panel": "dedicated", "reveal": "always"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Run camera demo (Godot + Python)",
+      "dependsOn": ["Run Godot publisher", "Run Python viewer", "Run Python viewer 2", "Run Python viewer 3"],
+      "dependsOrder": "parallel",
+      "problemMatcher": []
+    }
+  ]
+}

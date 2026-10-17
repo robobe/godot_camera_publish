@@ -1,0 +1,5 @@
+build/
+demo/.godot/
+demo/bin/*.so
+__pycache__/
+.venv/
