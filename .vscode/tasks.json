@@ -18,7 +18,7 @@
     {
       "label": "Run Python viewer",
       "type": "process",
-      "command": "python3",
+      "command": "${workspaceFolder}/.venv/bin/python",
       "args": ["-u", "${workspaceFolder}/viewer.py"],
       "options": {"cwd": "${workspaceFolder}"},
       "presentation": {"panel": "dedicated", "reveal": "always"},
@@ -27,8 +27,8 @@
     {
       "label": "Run Python viewer 2",
       "type": "process",
-      "command": "python3",
-      "args": ["-u", "${workspaceFolder}/viewer.py", "--port", "5002"],
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--camera", "2"],
       "options": {"cwd": "${workspaceFolder}"},
       "presentation": {"panel": "dedicated", "reveal": "always"},
       "problemMatcher": []
@@ -36,15 +36,24 @@
     {
       "label": "Run Python viewer 3",
       "type": "process",
-      "command": "python3",
-      "args": ["-u", "${workspaceFolder}/viewer.py", "--port", "5003"],
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--camera", "3"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "presentation": {"panel": "dedicated", "reveal": "always"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Python viewer 4 (camera 1)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-u", "${workspaceFolder}/viewer.py", "--camera", "1"],
       "options": {"cwd": "${workspaceFolder}"},
       "presentation": {"panel": "dedicated", "reveal": "always"},
       "problemMatcher": []
     },
     {
       "label": "Run camera demo (Godot + Python)",
-      "dependsOn": ["Run Godot publisher", "Run Python viewer", "Run Python viewer 2", "Run Python viewer 3"],
+      "dependsOn": ["Run Godot publisher", "Run Python viewer", "Run Python viewer 2", "Run Python viewer 3", "Run Python viewer 4 (camera 1)"],
       "dependsOrder": "parallel",
       "problemMatcher": []
     }

@@ -12,13 +12,18 @@ var second_viewport: SubViewport
 var third_viewport: SubViewport
 var cube: MeshInstance3D
 var elapsed := 0.0
+var transport := ZmqImagePublisher.new()
 
 
 func _ready() -> void:
+	if not transport.open():
+		set_process(false)
+		get_tree().quit(1)
+		return
 	_build_scene()
-	_start_publisher(viewport, 5001, 10.0)
-	_start_publisher(second_viewport, 5002, 85.0)
-	_start_publisher(third_viewport, 5003, 160.0)
+	_start_publisher(viewport, 1, 10.0)
+	_start_publisher(second_viewport, 2, 85.0)
+	_start_publisher(third_viewport, 3, 160.0)
 
 
 func _build_scene() -> void:
@@ -97,7 +102,7 @@ func _add_mesh(mesh: Mesh, position: Vector3, color: Color) -> MeshInstance3D:
 	return instance
 
 
-func _start_publisher(view: SubViewport, port: int, label_y: float) -> void:
+func _start_publisher(view: SubViewport, camera_id: int, label_y: float) -> void:
 	var label := Label.new()
 	label.position = Vector2(10, label_y)
 	label.add_theme_color_override("font_shadow_color", Color.BLACK)
@@ -106,7 +111,8 @@ func _start_publisher(view: SubViewport, port: int, label_y: float) -> void:
 	add_child(label)
 	var publisher := CameraPublisher.new()
 	publisher.viewport = view
-	publisher.port = port
+	publisher.camera_id = camera_id
+	publisher.transport = transport
 	publisher.stats_updated.connect(func(text: String) -> void: label.text = text)
 	add_child(publisher)
 
@@ -115,3 +121,7 @@ func _process(delta: float) -> void:
 	elapsed += delta
 	cube.rotation = Vector3(elapsed * 0.35, elapsed, 0)
 	cube.position.y = 1.1 + sin(elapsed * 2.0) * 0.35
+
+
+func _exit_tree() -> void:
+	transport.close()
