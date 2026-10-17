@@ -22,9 +22,9 @@ func _process(_delta: float) -> void:
 	if now - stats_started >= 1000000:
 		var seconds := (now - stats_started) / 1000000.0
 		var average_ms := capture_usec / 1000.0 / published if published > 0 else 0.0
-		var text := "Camera %d | Submitted: %.1f FPS | capture + copy: %.2f ms\nPublish failures: %d | %s" % [
+		var text := "Camera %d | Submitted: %.1f FPS | capture + copy: %.2f ms\nSkipped/failed: %d | %s" % [
 			camera_id, published / seconds, average_ms, dropped,
-			"ZeroMQ PUB, no delivery ACK"]
+			"ZeroMQ descriptors + SHM, no ACK"]
 		stats_updated.emit(text)
 		print(text.replace("\n", " | "))
 		published = 0

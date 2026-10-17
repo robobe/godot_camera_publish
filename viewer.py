@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Display a local ZeroMQ TCP RGB8 camera stream."""
+"""Display a local ZeroMQ-signaled SHM RGB8 camera stream."""
 import argparse
+import fcntl
+import mmap
+import re
+import stat
 import json
 import os
 import time
@@ -14,7 +18,11 @@ WIDTH, HEIGHT = 640, 480
 FRAME_BYTES = WIDTH * HEIGHT * 3
 ENDPOINT = "tcp://127.0.0.1:5555"
 DEFAULT_BUFFER_BYTES = 65536
-MAX_MESSAGE_BYTES = 1024 * 1024
+MAX_MESSAGE_BYTES = 2048
+HEADER = struct.Struct("<8s6I4Q64s")
+MAGIC = b"GCSHM02\0"
+SLOT_BYTES = HEADER.size + FRAME_BYTES
+assert HEADER.size == 128
 
 
 class ReceivedFPS:
@@ -43,6 +51,50 @@ def buffer_bytes():
     return int(value)
 
 
+class ShmSlot:
+    """A validated read-only mapping with an open descriptor for advisory locking."""
+
+    def __init__(self, name):
+        self.fd = os.open("/dev/shm" + name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            info = os.fstat(self.fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size != SLOT_BYTES):
+                raise ValueError("Invalid SHM ownership, permissions, or size")
+            self.memory = mmap.mmap(self.fd, SLOT_BYTES, access=mmap.ACCESS_READ)
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def read(self, metadata):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        try:
+            (magic, version, camera, slot, width, height, fmt, size,
+             frame_id, capture_usec, valid, raw_stream) = HEADER.unpack_from(self.memory)
+            if valid == 0:
+                return None
+            expected_stream = metadata["stream_id"].encode().ljust(64, b"\0")
+            if (magic != MAGIC or version != 2 or camera != metadata["camera_id"]
+                    or slot != metadata["slot"] or (width, height, fmt, size) != (WIDTH, HEIGHT, 1, FRAME_BYTES)
+                    or valid != 1 or raw_stream != expected_stream):
+                raise ValueError("Invalid SHM header identity or layout")
+            if frame_id != metadata["frame_id"]:
+                return None
+            if capture_usec != metadata["capture_usec"]:
+                raise ValueError("SHM timestamp does not match descriptor")
+            # Copy while holding the reader lock; OpenCV must never retain an unlocked SHM view.
+            return self.memory[HEADER.size:]
+        finally:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+
+    def close(self):
+        self.memory.close()
+        os.close(self.fd)
+
+
 class FrameReceiver:
     """One camera per SUB socket, retaining the latest complete message."""
 
@@ -56,6 +108,7 @@ class FrameReceiver:
         self.stream_id = None
         self.capture_usec = 0
         self.last_frame_time = None
+        self.mappings = {}
         self.context = zmq.Context()
         self.sock = self.context.socket(zmq.SUB)
         try:
@@ -70,37 +123,58 @@ class FrameReceiver:
             raise
 
     def decode(self, message):
-        if len(message) > MAX_MESSAGE_BYTES or not message.startswith(self.topic):
-            raise ValueError("Invalid camera topic or oversized message")
+        if len(message) > MAX_MESSAGE_BYTES:
+            raise ValueError("Expected a descriptor-only ZeroMQ message, at most 2048 bytes")
+        if not message.startswith(self.topic):
+            raise ValueError("Invalid camera topic")
         offset = len(self.topic)
         if len(message) < offset + 4:
             raise ValueError("Truncated metadata length")
         length = struct.unpack_from("<I", message, offset)[0]
         start = offset + 4
-        if not 1 <= length <= 1024 or len(message) < start + length:
+        if not 1 <= length <= 1024 or len(message) != start + length:
             raise ValueError("Invalid metadata length")
         metadata = json.loads(message[start:start + length])
-        expected = {"version": 1, "camera_id": self.camera_id,
-                    "width": WIDTH, "height": HEIGHT, "format": "RGB8"}
+        expected = {"version": 2, "camera_id": self.camera_id,
+                    "width": WIDTH, "height": HEIGHT, "format": "RGB8", "bytes": FRAME_BYTES}
         if not isinstance(metadata, dict) or any(type(metadata.get(k)) is not type(v) or metadata[k] != v
                                                 for k, v in expected.items()):
             raise ValueError("Unsupported camera metadata")
         stream_id = metadata.get("stream_id")
         frame_id, capture_usec = metadata.get("frame_id"), metadata.get("capture_usec")
-        if (not isinstance(stream_id, str) or not stream_id or len(stream_id) > 128
+        if (not isinstance(stream_id, str) or not re.fullmatch(r"[0-9]+-[0-9]+", stream_id) or len(stream_id) > 63
                 or type(frame_id) is not int or frame_id <= 0
                 or type(capture_usec) is not int or capture_usec < 0):
             raise ValueError("Invalid frame identity or timestamp")
-        if len(message) - start - length != FRAME_BYTES:
-            raise ValueError("Invalid RGB8 payload length")
+        slot = metadata.get("slot")
+        if type(slot) is not int or slot not in (0, 1, 2):
+            raise ValueError("Invalid SHM slot index")
+        name = metadata.get("shm_name")
+        if name != f"/godot_camera_zmq_{stream_id}_c{self.camera_id}_s{slot}":
+            raise ValueError("Invalid SHM name")
         if stream_id == self.stream_id and frame_id <= self.frame_id:
             return None
-        # recv() already owns immutable bytes, so NumPy can retain them without another pixel copy.
-        message = bytes(message)
-        self.stream_id, self.frame_id = stream_id, frame_id
+        if stream_id != self.stream_id:
+            self._close_mappings()
+            self.stream_id = stream_id
+            self.frame_id = 0
+        if name not in self.mappings:
+            try:
+                self.mappings[name] = ShmSlot(name)
+            except FileNotFoundError:
+                return None  # Publisher may have unlinked the old session during restart.
+        pixels = self.mappings[name].read(metadata)
+        if pixels is None:
+            return None
+        self.frame_id = frame_id
         self.capture_usec = capture_usec
         self.last_frame_time = time.monotonic()
-        return np.frombuffer(message, dtype=np.uint8, offset=start + length).reshape(HEIGHT, WIDTH, 3)
+        return np.frombuffer(pixels, dtype=np.uint8).reshape(HEIGHT, WIDTH, 3)
+
+    def _close_mappings(self):
+        for mapping in self.mappings.values():
+            mapping.close()
+        self.mappings.clear()
 
     def poll(self):
         try:
@@ -112,6 +186,7 @@ class FrameReceiver:
         return self.decode(message)
 
     def close(self):
+        self._close_mappings()
         self.sock.close(linger=0)
         self.context.term()
 
@@ -127,13 +202,13 @@ def draw_overlay(image, fps, status, frame_id):
 
 
 def main(camera_id=1):
-    window = f"Godot ZeroMQ camera {camera_id} ({os.getpid()}) - Q / Esc to quit"
+    window = f"Godot ZeroMQ SHM camera {camera_id} ({os.getpid()}) - Q / Esc to quit"
     receiver = FrameReceiver(camera_id)
     fps = ReceivedFPS(time.monotonic())
     image = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
     last_report = time.monotonic()
     cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
-    print(f"Subscribed to godot/camera/{camera_id}/image; ZeroMQ TCP, no SHM", flush=True)
+    print(f"Subscribed to godot/camera/{camera_id}/image; ZeroMQ descriptors + SHM", flush=True)
     try:
         while True:
             frame = receiver.poll()
@@ -144,7 +219,7 @@ def main(camera_id=1):
             fps.update(now)
             status = "Waiting for frames"
             if receiver.last_frame_time is not None:
-                status = "Live (ZeroMQ)" if now - receiver.last_frame_time < 1.0 else "No frames"
+                status = "Live (ZeroMQ SHM)" if now - receiver.last_frame_time < 1.0 else "No frames"
             cv2.imshow(window, draw_overlay(image, fps.value, status, receiver.frame_id))
             if now - last_report >= 1.0:
                 print(f"Received FPS: {fps.value:.1f} | {status} | Frame: {receiver.frame_id}", flush=True)
@@ -160,7 +235,7 @@ def main(camera_id=1):
             time.sleep(0.005)
     except KeyboardInterrupt:
         pass
-    except (ValueError, zmq.ZMQError) as error:
+    except (OSError, ValueError, zmq.ZMQError) as error:
         raise SystemExit(f"Camera stream rejected: {error}") from error
     finally:
         receiver.close()

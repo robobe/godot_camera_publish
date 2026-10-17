@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure four real viewers on NVIDIA; --tune compares three socket buffer sizes."""
+"""Measure four ZeroMQ/SHM viewers on NVIDIA; --tune compares signaling socket buffers."""
 import argparse
 import csv
 import datetime
@@ -32,7 +32,7 @@ def choose_buffer(results):
 
 def measure(size, seconds):
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    out = ROOT / 'build' / f'benchmark-zmq-{size}-{stamp}'
+    out = ROOT / 'build' / f'benchmark-zmq-shm-{size}-{stamp}'
     out.mkdir(parents=True)
     env = {**os.environ, 'CAMERA_ZMQ_BUFFER_BYTES': str(size)}
     commands = {'godot': [str(Path.home() / '.local/bin/godot'), '--path', str(ROOT / 'demo'),
@@ -61,7 +61,7 @@ def measure(size, seconds):
             assert all(p.poll() is None for p in children.values()), f'A demo process exited: {out}'
             assert gpu.poll() is None, 'NVIDIA monitoring exited'
             ready = 'Using Device: NVIDIA' in (out / 'godot.log').read_text()
-            if (ready and all('Live (ZeroMQ)' in (out / f'{v}.log').read_text() for v in viewers)
+            if (ready and all('Live (ZeroMQ SHM)' in (out / f'{v}.log').read_text() for v in viewers)
                     and (out / 'nvidia.csv').stat().st_size):
                 break
             time.sleep(.1)
@@ -73,7 +73,9 @@ def measure(size, seconds):
             connections = process.connections(kind='inet')
             assert connections and all(c.type == socket.SOCK_STREAM for c in connections), name
             mappings = Path(f'/proc/{process.pid}/maps').read_text()
-            assert '/dev/shm/godot_camera_' not in mappings and '.zenoh' not in mappings, name
+            slot_names = set(re.findall(r'/dev/shm/(godot_camera_zmq_[^\s]+)', mappings))
+            assert (len(slot_names) == 9 if name == 'godot' else 1 <= len(slot_names) <= 3), name
+            assert '.zenoh' not in mappings, name
             process.cpu_percent()
         (out / 'tcp-sockets.log').write_text(subprocess.check_output(['ss', '-tmipn'], text=True))
         offsets = {name: (out / f'{name}.log').stat().st_size for name in viewers}
@@ -97,7 +99,7 @@ def measure(size, seconds):
         for name in viewers:
             text = (out / f'{name}.log').read_bytes()[offsets[name]:].decode()
             values = [float(x) for x in re.findall(r'Received FPS: ([0-9.]+)', text)]
-            assert len(values) >= seconds - 2 and 'Live (ZeroMQ)' in text, name
+            assert len(values) >= seconds - 2 and 'Live (ZeroMQ SHM)' in text, name
             rates[name + '_fps'] = dict(mean=statistics.mean(values), min=min(values),
                                         max=max(values), samples=len(values))
         for name in viewers:
@@ -108,6 +110,8 @@ def measure(size, seconds):
         assert all(p.returncode == 0 for p in children.values()), 'Expected clean exits'
         godot_log = (out / 'godot.log').read_text()
         assert 'ERROR:' not in godot_log and 'SCRIPT ERROR' not in godot_log
+        names = re.findall(r'SHM slot: /([^\s]+)', godot_log)
+        assert len(names) == 9 and all(not (Path('/dev/shm') / n).exists() for n in names), 'SHM cleanup failed'
         assert len(rows) == seconds and duration >= seconds
         summary = dict(buffer_bytes=size, duration_s=duration, samples=len(rows),
                        logical_cpus=psutil.cpu_count(), output=str(out), **rates)
@@ -136,6 +140,10 @@ def measure(size, seconds):
                     child.wait()
         for handle in logs.values():
             handle.close()
+        if 'godot' in children:
+            for name in re.findall(r'SHM slot: /([^\s]+)', (out / 'godot.log').read_text()):
+                if name.startswith(f'godot_camera_zmq_{children["godot"].pid}-'):
+                    (Path('/dev/shm') / name).unlink(missing_ok=True)
 
 
 def main():
@@ -145,12 +153,12 @@ def main():
     if args.tune:
         results = [measure(size, 10) for size in (65536, 262144, 1048576)]
         selection = dict(selected_buffer_bytes=choose_buffer(results), results=results)
-        path = ROOT / 'build' / 'zmq-buffer-tuning.json'
+        path = ROOT / 'build' / 'zmq-shm-buffer-tuning.json'
         path.write_text(json.dumps(selection, indent=2)+'\n')
         print(f'Selected {selection["selected_buffer_bytes"]} bytes; {path}', flush=True)
     else:
         result = measure(buffer_bytes(), 30)
-        (ROOT / 'build' / 'zmq-benchmark-latest.json').write_text(json.dumps(result, indent=2)+'\n')
+        (ROOT / 'build' / 'zmq-shm-benchmark-latest.json').write_text(json.dumps(result, indent=2)+'\n')
         print('RESULT:', result['output'], flush=True)
 
 

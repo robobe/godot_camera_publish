@@ -1,12 +1,12 @@
-# Godot cameras → ZeroMQ TCP → Python
+# Godot cameras → shared memory, with ZeroMQ signaling
 
-The `zmq` branch sends complete RGB8 images through **ZeroMQ PUB/SUB over local TCP**, with **no application shared memory**. One Godot process renders three cameras and four Python processes subscribe to cameras **1, 2, 3, 1**. Viewers 1 and 4 subscribe to the same topic independently.
+The `zmq_shm` branch keeps ZeroMQ PUB/SUB for topic notifications and transports **image pixels through POSIX shared memory**. One Godot process renders three cameras; four Python viewer processes subscribe to cameras **1, 2, 3, 1**. Viewers 1 and 4 independently read the same camera's storage.
 
-Each camera is **640 × 480 RGB8**, targeting **30 FPS**, with **90° horizontal FOV**. Cameras 2 and 3 are offset +1 m and +2 m to camera 1's right, with matching orientations and the same world. Godot's preview shows camera 1.
+Each camera produces **640×480 RGB8**, targets **30 FPS**, and has **90° horizontal FOV**. Cameras 2 and 3 are offset +1 m and +2 m to camera 1's right, with matching orientations in the same world. The original image-over-TCP example remains on branch `zmq` at `b2356e3`.
 
-## Build
+## Build and run
 
-Requires x86-64 Linux, Godot 4.7, GCC, CMake 3.22+, Ninja, and Python 3.12. The NVIDIA checks require an active graphical desktop and a working proprietary NVIDIA driver.
+Requires x86-64 Linux, Godot 4.7, GCC, CMake 3.22+, Ninja, Python 3.12, and a graphical desktop. NVIDIA rendering requires its proprietary driver. The native extension uses system libzmq 4.3.5 or newer; the development machine uses libzmq 4.3.5 and pyzmq 24.0.1.
 
 ```bash
 sudo apt install build-essential cmake ninja-build pkg-config libzmq3-dev python3-venv
@@ -17,20 +17,16 @@ cmake --build --preset debug
 ~/.local/bin/godot --editor --path demo --import
 ```
 
-Adjust the Godot executable path if installed elsewhere. The extension links against the system `libzmq` (4.3.5 or newer); Python uses `pyzmq`. The development machine has libzmq 4.3.5 and pyzmq 24.0.1. No broker, Zenoh, Rust build, or separate messaging service is needed.
+Adjust the Godot executable path if installed elsewhere. Rebuild and import after switching branches: ignored native libraries and Godot's import cache are shared build artifacts.
 
-After switching branches, rebuild and import before running: ignored generated libraries and the Godot import cache are shared across checkouts. The extension is `demo/bin/libcamera_zmq.so`.
-
-## Run on NVIDIA
-
-Run Godot in its own terminal:
+Start Godot in one terminal:
 
 ```bash
 __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia \
   ~/.local/bin/godot --path demo
 ```
 
-Confirm the console says `Using Device: NVIDIA` and `ZeroMQ PUB listening on tcp://127.0.0.1:5555`. Start each viewer in a separate terminal:
+Confirm the console says `Using Device: NVIDIA` and `ZeroMQ SHM PUB listening on tcp://127.0.0.1:5555`. It also lists the nine SHM slot names it owns. Start each viewer in a separate terminal:
 
 ```bash
 .venv/bin/python viewer.py --camera 1
@@ -39,11 +35,11 @@ Confirm the console says `Using Device: NVIDIA` and `ZeroMQ PUB listening on tcp
 .venv/bin/python viewer.py --camera 1  # Fourth viewer, same topic as viewer 1
 ```
 
-In VS Code, run **Build debug**, then **Run camera demo (Godot + Python)**. The compound task opens five dedicated terminals: Godot and four viewers using `.venv/bin/python`. Each viewer window includes its PID. Q, Esc, or closing a viewer window stops that viewer.
+In VS Code, run **Build debug**, then **Run camera demo (Godot + Python)**. Five dedicated terminals run Godot and the four viewers. Each viewer window includes its PID; Q, Esc, or closing its window stops it.
 
-Viewers may start before Godot. ZeroMQ connects and reconnects asynchronously, so the UI remains responsive while waiting. Initial frames can be missed while topic subscriptions propagate. Restarting Godot creates a new publisher-session ID, allowing frame IDs to restart. There is no startup handshake or frame acknowledgment.
+Viewers can start before Godot and automatically reconnect when it restarts. Initial notifications may be missed while ZeroMQ subscriptions propagate. The application is for trusted processes on the same Linux host; it does not configure authentication or remote image transport.
 
-## Topics and message format
+## Topics and protocol
 
 | Camera | Topic | Offset | Viewers |
 | --- | --- | --- | --- |
@@ -51,129 +47,141 @@ Viewers may start before Godot. ZeroMQ connects and reconnects asynchronously, s
 | 2 | `godot/camera/2/image` | +1 m right | 2 |
 | 3 | `godot/camera/3/image` | +2 m right | 3 |
 
-The native extension owns one context and PUB socket bound to `tcp://127.0.0.1:5555`. Each viewer owns one context and SUB socket, filtering its exact camera topic including the terminating NUL byte. The fixed endpoint is the connection address; there is no discovery service. This is a trusted localhost demo without authentication or LAN configuration.
+One native ZeroMQ PUB socket binds to `tcp://127.0.0.1:5555`. Each viewer has a SUB socket filtering its exact camera topic including a terminating NUL. Each notification is **one complete ZeroMQ message**, containing the NUL-terminated topic, a little-endian uint32 JSON length, and UTF-8 JSON. There are **no image bytes** in the ZeroMQ message. Metadata is limited to 1,024 bytes and the entire notification to 2 KiB.
 
-Each publication is **one ZeroMQ message**, with this layout:
-
-| Field | Representation |
-| --- | --- |
-| Topic | UTF-8 topic followed by one NUL byte |
-| Metadata length | Unsigned 32-bit little-endian integer |
-| Metadata | UTF-8 JSON, 1–1,024 bytes |
-| Pixels | Exactly 921,600 bytes, row-major 640×480 RGB8, top to bottom |
-
-Example metadata:
+Example descriptor:
 
 ```json
-{"version":1,"camera_id":1,"width":640,"height":480,"format":"RGB8","frame_id":100,"capture_usec":3456789,"stream_id":"publisher-session-id"}
+{"version":2,"camera_id":1,"width":640,"height":480,"format":"RGB8","bytes":921600,"frame_id":123,"capture_usec":3456789,"stream_id":"12345-6789012345","slot":2,"shm_name":"/godot_camera_zmq_12345-6789012345_c1_s2"}
 ```
 
-`frame_id` counts render events. `capture_usec` is Godot's monotonic tick count before readback, not wall-clock time and not directly comparable to Python's clock. Python validates topic, framing, metadata, and pixel length. Duplicate or older frame IDs within one session are ignored. Different sessions may restart at frame 1.
+Protocol version 2 intentionally rejects the version-1 image-over-TCP messages. `frame_id` counts render events; `capture_usec` is Godot's monotonic tick count before readback, not wall time or a timestamp directly comparable with Python's clock. A new publisher gets a unique session ID and new SHM names, allowing frame counters to reset safely.
 
-The native extension allocates a ZeroMQ-owned message and copies RGB pixels directly into it. Python `recv()` returns privately owned immutable bytes; NumPy references the pixel portion of those bytes without another full image copy. The image remains valid after the message is processed or the socket closes. At 30 FPS, raw pixel payload is about 27.6 MB/s per viewer, or 110.6 MB/s across the four unicast connections, before protocol overhead. GPU readback, native message copying, TCP transfer, and RGB-to-BGR display conversion still incur work.
+Each camera has **three independently lockable SHM slots**, for nine objects total. Every object has mode `0600` and is exactly **921,728 bytes**: a 128-byte header and 921,600 contiguous RGB8 pixel bytes. Total pixel storage is approximately **7.9 MiB**.
 
-## Buffering and freshness
+The header is explicitly serialized little-endian, matching Python's `struct.Struct("<8s6I4Q64s")`:
 
-The publisher sets **SNDHWM=1**, **SNDTIMEO=0**, and sends with **DONTWAIT**. Each SUB socket sets **CONFLATE=1** to retain its newest complete message, and **MAXMSGSIZE=1 MiB**. All sockets use **LINGER=0** for prompt shutdown. There is no application frame backlog or application ACK. Slow viewers can miss images without blocking the rendering loop or other viewers.
+| Header fields in order | Encoding |
+| --- | --- |
+| Magic `GCSHM02` plus NUL | 8 bytes |
+| Version, camera ID, slot index, width, height, pixel-format code (`1` = RGB8) | Six uint32 values |
+| Pixel byte count, frame ID, capture timestamp, completion flag (`0` = incomplete, `1` = complete) | Four uint64 values |
+| ASCII publisher-session ID, padded with NUL bytes | 64 bytes |
 
-Conflation supersedes receive high-water marks and **does not support multipart messages**. Keeping topic, metadata, and pixels in one message avoids losing individual parts. Each subscriber selects one camera so other topics cannot replace its pending image. The native PUB socket does not use conflation across its three topics. See the [ZeroMQ socket-option documentation](https://libzmq.readthedocs.io/en/latest/zmq_setsockopt.html#zmq-conflate-keep-only-last-message).
+Pixels follow the header, row-major, top to bottom, with no alpha channel.
 
-A viewer regularly calls nonblocking `recv()` to service its conflated queue. An indefinitely frozen process is not a strict one-frame total-memory guarantee: ZeroMQ internals, partially transferred data, TCP kernel buffers, and UI images also consume memory.
+## Slot ownership and synchronization
 
-`CAMERA_ZMQ_BUFFER_BYTES` sets the publisher's **SNDBUF** and the viewers' **RCVBUF**, in bytes. It must be a decimal integer from **1,024 through 4,194,304**. Set it in every process when comparing sizes, or export it before launching the compound task. The benchmark runner applies it consistently to all children. Linux may adjust/double requested socket buffer sizes and enforce kernel limits; no system-wide socket settings are modified.
+1. Godot tries slots in rotating order with `flock(LOCK_EX | LOCK_NB)`. If all three are busy, it skips that camera's publication without waiting.
+2. While holding the exclusive lock, it invalidates the old completion flag, writes the header and pixels, and commits the completion flag only after the data is complete. It unlocks before publishing the descriptor.
+3. Each viewer opens its notified object read-only, validating its name, owner, exact permissions, and size. It caches at most three mappings for its camera and retains the associated descriptors for locking.
+4. The viewer tries `flock(LOCK_SH | LOCK_NB)`. It verifies the committed header matches the descriptor's session, camera, slot, frame, format, size, and timestamp, then copies pixels into private bytes while still locked.
+5. It unlocks in `finally`. NumPy/OpenCV use the private copy, so a slow display cannot keep an SHM image alive accidentally.
 
-```bash
-export CAMERA_ZMQ_BUFFER_BYTES=65536
-```
+Multiple viewers can hold shared reader locks simultaneously. Writers require an exclusive lock and therefore cannot overwrite a slot being copied. A locked slot, an incomplete write, a stale frame notification, or an already-reused slot is skipped normally. Missing SHM objects during restart are also skipped; malformed descriptors and invalid object/header layouts produce stream errors.
 
-The default is **65,536 bytes (64 KiB)**, selected by the measurements below. The Godot overlay counts publication submissions and local send failures, which are not proof of delivery: PUB may silently drop messages at its high-water mark or when no subscribers are connected. The Python overlay counts completed received/displayed frames over each actual elapsed reporting interval. Thirty FPS is a target rather than a delivery guarantee.
+This is **independent latest-frame delivery**, not a barrier across subscribers or cameras. Viewers may display different frame IDs. No subscriber registry, per-frame ACK, lease, or shared reference count is needed. Missed notifications do not strand slots: ownership is determined by OS locks. All cooperating processes must honor those advisory locks. See [Linux flock semantics](https://man7.org/linux/man-pages/man2/flock.2.html).
+
+The PUB socket retains SNDHWM=1, SNDTIMEO=0, and nonblocking sends. Each SUB uses CONFLATE=1 and receives regularly to service its latest-notification queue. All sockets use LINGER=0. Keeping descriptors in a single message avoids multipart/conflation incompatibility.
+
+The signaling socket buffer default remains **64 KiB**. `CAMERA_ZMQ_BUFFER_BYTES` overrides publisher SNDBUF and viewer RCVBUF, accepting decimal integers from 1,024 through 4,194,304. It controls signaling sockets, **not SHM slot size**. Linux may adjust the actual kernel sizes. No system-wide socket settings are changed.
+
+The Godot overlay reports notification submissions and local skipped/failed publications, including busy slots. ZeroMQ PUB may silently drop notifications, so a successful submission is not proof of delivery. The Python overlay reports completed private frame copies over actual elapsed intervals and displays `Live (ZeroMQ SHM)` while receiving frames. Thirty FPS remains a target, not a delivery guarantee.
 
 ## Flow and sequence
 
 ```mermaid
 flowchart LR
-    World[Shared Godot scene on NVIDIA GPU] --> Cameras[Three offset cameras]
+    World[Godot scene on NVIDIA GPU] --> Cameras[Three offset cameras]
     Cameras --> RGB[GPU readback and RGB8 conversion]
-    RGB --> PUB[One ZeroMQ PUB socket with three topics]
-    PUB --> TCP[Local TCP unicast]
-    TCP --> V1[Viewer 1 - camera 1]
-    TCP --> V2[Viewer 2 - camera 2]
-    TCP --> V3[Viewer 3 - camera 3]
-    TCP --> V4[Viewer 4 - camera 1]
-    V1 --> Display[Owned bytes, NumPy RGB view, OpenCV BGR display]
+    RGB --> Slots[Nine SHM slots, three per camera]
+    Slots --> PUB[ZeroMQ PUB sends small descriptors]
+    PUB --> V1[Viewer 1 SUB - camera 1]
+    PUB --> V2[Viewer 2 SUB - camera 2]
+    PUB --> V3[Viewer 3 SUB - camera 3]
+    PUB --> V4[Viewer 4 SUB - camera 1]
+    Slots --> Read[Read-lock slot and copy pixels privately]
+    V1 --> Read
+    V2 --> Read
+    V3 --> Read
+    V4 --> Read
+    Read --> Display[Unlock, convert RGB to BGR and display]
 ```
 
-Camera 1 publishes once, and ZeroMQ delivers independently to its two subscribers:
+Camera 1's two viewers independently read one publication:
 
 ```mermaid
 sequenceDiagram
-    participant G as Godot camera 1 capture
-    participant N as Native ZeroMQ PUB
-    participant V1 as Python viewer 1 SUB
-    participant V4 as Python viewer 4 SUB
-    V1->>N: Connect and subscribe to camera 1 topic
-    V4->>N: Connect and subscribe to the same topic
-    G->>G: Read back GPU image and convert to RGB8
-    G->>N: publish_frame with pixels and frame identity
-    N->>N: Allocate owned message, copy topic, metadata and pixels
-    N->>N: Nonblocking send with SNDHWM=1
-    N-->>G: Submission result, no delivery ACK
-    N-->>V1: One complete topic plus metadata plus image message
-    N-->>V4: Independent delivery of the same publication
-    Note over V1,V4: Each SUB socket conflates complete messages to the latest
-    par Viewer 1 UI loop
-        V1->>V1: Nonblocking recv, validate message and frame identity
-        V1->>V1: Retain owned bytes, convert RGB to BGR, display, count FPS
-    and Viewer 4 UI loop
-        V4->>V4: Nonblocking recv, validate message and frame identity
-        V4->>V4: Retain owned bytes, convert RGB to BGR, display, count FPS
+    participant G as Godot camera 1
+    participant M as Camera 1 SHM slots
+    participant Z as ZeroMQ PUB
+    participant V1 as Viewer 1 SUB
+    participant V4 as Viewer 4 SUB
+    V1->>Z: Subscribe to camera 1 topic
+    V4->>Z: Subscribe to the same topic
+    G->>M: Try exclusive nonblocking lock on a free slot
+    alt Slot available
+        G->>M: Invalidate, write header and pixels, commit
+        G->>M: Unlock
+        G->>Z: Publish descriptor only
+        Z-->>V1: Session, slot name and frame identity
+        Z-->>V4: Same descriptor
+        par Viewer 1
+            V1->>M: Try shared read lock and verify identity
+            M-->>V1: Copy pixels into private bytes
+            V1->>M: Unlock
+            V1->>V1: Convert and display private image
+        and Viewer 4
+            V4->>M: Try shared read lock and verify identity
+            M-->>V4: Copy pixels into private bytes
+            V4->>M: Unlock
+            V4->>V4: Convert and display private image
+        end
+        Note over V1,V4: Skip busy, incomplete or reused slots, no application ACK
+    else All slots busy
+        G->>G: Skip this publication and continue rendering
     end
 ```
 
-## Measured buffer tuning and NVIDIA performance
+## Shutdown, crashes and cleanup
 
-Measured on **2026-10-17**, with three 640×480 RGB8 cameras and **four real viewer processes** on cameras 1, 2, 3, 1. Each run started after every viewer received frames and a 3-second warmup. Godot used the NVIDIA GeForce RTX 5070 Laptop GPU with normal VSync.
+Normal Godot shutdown closes and unlinks only its own nine SHM objects. Already-open mappings remain valid until their readers close them. A new session makes viewers close their old mappings. Viewer shutdown closes every mapping, descriptor, and ZeroMQ socket.
 
-Ten-second buffer comparisons (requested kernel bytes per socket, with SNDHWM=1 and SUB conflation):
+When a process dies, the OS closes its descriptors and releases its locks. The completion flag prevents a reader from accepting pixels left partially written by a crashed producer. Killing a reader cannot permanently strand a slot lock.
 
-| Buffer request | Viewer 1 FPS | Viewer 2 FPS | Viewer 3 FPS | Viewer 4 FPS | Godot CPU |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 64 KiB | 29.98 | 30.01 | 30.05 | 30.02 | 45.8% |
-| 256 KiB | 29.98 | 30.06 | 30.06 | 30.02 | 49.9% |
-| 1024 KiB | 29.97 | 30.04 | 29.93 | 29.96 | 48.9% |
+An abrupt publisher kill can leave orphaned SHM names. The test/benchmark harness removes only the objects recorded for its own stopped publishers. For manual cleanup, first stop the affected publisher and viewers, confirm the PID/session in the startup log belongs to that stopped run, and remove only those exact logged names under `/dev/shm`. Do not delete all shared-memory files or objects belonging to another run. Restart never reuses stale session names.
 
-**Selected default: 64 KiB (65,536 bytes)** for publisher SNDBUF and viewer RCVBUF. All candidates met the 29 FPS threshold in every viewer; 64 KiB was the smallest tested request that qualified. This is a measured default for this host, not a universal optimum.
+## Measured NVIDIA performance
 
-The final **30.001-second** run used the selected 64 KiB default, with 30 resource samples at 1 Hz:
+Measured on **2026-10-17** for **30.002 seconds**, at 1 Hz after initialization and a 3-second warmup. Three 640×480 RGB8 cameras targeted 30 FPS, with four separate viewer processes on cameras **1, 2, 3, 1**. Godot used the NVIDIA GeForce RTX 5070 Laptop GPU, normal VSync, three SHM slots per camera, and 64 KiB signaling socket buffers.
 
 | Process | Average received FPS | FPS min–max | Average CPU | Peak CPU | Average RSS | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Godot | — | — | 48.4% | 52.0% | 207.4 MiB | 207.4 MiB |
-| Viewer 1 (camera 1) | 30.02 | 29.7–30.9 | 46.5% | 50.0% | 213.1 MiB | 213.1 MiB |
-| Viewer 2 (camera 2) | 30.03 | 29.7–31.0 | 46.1% | 49.0% | 215.6 MiB | 215.6 MiB |
-| Viewer 3 (camera 3) | 29.98 | 29.7–30.9 | 46.7% | 49.0% | 212.6 MiB | 212.6 MiB |
-| Viewer 4 (camera 1) | 29.99 | 29.7–31.0 | 46.6% | 49.0% | 212.5 MiB | 212.5 MiB |
+| Godot | — | — | 46.1% | 49.0% | 211.3 MiB | 211.3 MiB |
+| Viewer 1 (camera 1) | 30.01 | 28.9–30.9 | 46.0% | 49.4% | 213.9 MiB | 213.9 MiB |
+| Viewer 2 (camera 2) | 30.01 | 28.8–31.8 | 46.3% | 49.0% | 215.2 MiB | 215.6 MiB |
+| Viewer 3 (camera 3) | 30.00 | 28.7–30.9 | 46.4% | 49.0% | 213.7 MiB | 213.7 MiB |
+| Viewer 4 (camera 1) | 30.03 | 29.7–30.9 | 46.6% | 52.0% | 214.9 MiB | 215.5 MiB |
 
 | NVIDIA whole-device metric | Average | Peak |
 | --- | ---: | ---: |
-| GPU utilization | 10.9% | 12.0% |
+| GPU utilization | 9.5% | 12.0% |
 | VRAM used | 114.0 MiB | 114.0 MiB |
 
-CPU 100% means one logical core (16 available). RSS includes shared pages and should not be summed as unique physical memory. NVIDIA metrics cover the whole device, including other clients. FPS min/max describe viewer reporting intervals. All four viewers and Godot exited cleanly; the runner verified TCP-only connections and absence of application SHM mappings. This is a short desktop run, not a long-duration stability or latency guarantee.
+CPU 100% means one logical core (16 available). RSS includes shared pages and should not be summed as unique physical memory. GPU metrics cover the whole device, including other clients. FPS min/max describe the viewer reporting intervals. This is a short desktop run, not a long-duration stability or latency guarantee.
 
-Final raw results: `build/benchmark-zmq-65536-20261017-082206-156146/`. Tuning results: `build/zmq-buffer-tuning.json`. CSV samples, JSON summaries, process logs, and TCP socket information are kept in those local build artifacts.
+All four viewers and Godot exited cleanly, and all nine SHM objects were removed. The runner verified TCP signaling and expected SHM mappings in all five processes. Raw results: `build/benchmark-zmq-shm-65536-20261017-102611-347592/`.
 
-## Checks and benchmarks
+## Checks and benchmark
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python tests/check_pipeline.py
-.venv/bin/python tools/benchmark_zmq.py --tune
 .venv/bin/python tools/benchmark_zmq.py
 ```
 
-Unit checks cover framing, topic isolation, metadata, pixel length, image ownership, stale frames, restart identities, buffer validation, FPS, and the buffer-selection rule. The rendered integration check verifies real native image delivery, common-frame pixel equality for duplicate subscribers, distinct camera views, subscriber-first startup, a paused/closed reader, freshness after resuming, and publisher restart.
+Unit checks cover descriptors, header layout/identity, invalid object permissions/size/type, incomplete and reused slots, private image ownership, session mapping cleanup, and interrupted writes. The native integration check covers duplicate-subscriber pixel equality, camera offsets, subscriber-first startup, slot rotation around readers, all-slots-busy behavior, killed readers, publisher restart, killed publishers, mapping cleanup, and normal SHM unlinking.
 
-`--tune` measures **64 KiB, 256 KiB, and 1 MiB** socket-buffer requests for **10 seconds each**, after all four real viewers receive frames and a 3-second warmup. It chooses the smallest size for which every viewer averages at least 29 FPS. If none qualifies, it chooses the highest minimum viewer-average FPS, rounding ties to 0.1 FPS and favoring the smaller buffer. It reports a recommendation without rewriting source defaults.
+The benchmark launches NVIDIA Godot and four actual viewer processes, waits for images, warms up for 3 seconds, then measures **30 seconds** of FPS, per-process CPU/RSS, and whole-device NVIDIA utilization/VRAM. It verifies TCP signaling, nine publisher SHM mappings, at most three mappings per viewer, and normal cleanup. Results are saved under `build/benchmark-zmq-shm-*` and `build/zmq-shm-benchmark-latest.json`. Optional `--tune` compares only signaling socket buffers and writes `build/zmq-shm-buffer-tuning.json`; the earlier bulk-image TCP tuning results must not be interpreted as SHM tuning.
 
-The ordinary benchmark measures **30 seconds**, sampling process CPU/RSS and NVIDIA whole-device GPU/VRAM at 1 Hz. It verifies NVIDIA rendering, TCP sockets, absence of application SHM mappings, and clean exits. Raw CSV, JSON summaries, process logs, and TCP socket information are saved under `build/benchmark-zmq-*`; tuning selection is in `build/zmq-buffer-tuning.json`. The final summary is also copied to `build/zmq-benchmark-latest.json`.
+See [PERFORMANCE.md](PERFORMANCE.md) for the historical comparisons, including their different viewer counts. This design still performs GPU readback, one native copy into SHM and a private Python copy per received image; it does not provide end-to-end zero-copy display.
